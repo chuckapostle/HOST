@@ -1,0 +1,16 @@
+parameter,value,unit,description
+R0_mm,50,mm,Entry surface radius of curvature (positive = centre of curvature to the right)
+R1_mm,-30,mm,Mid surface radius of curvature
+R2_mm,-50,mm,Exit surface radius of curvature
+t1_mm,5,mm,Thickness of layer 1 (mat1)
+t2_mm,5,mm,Thickness of layer 2 (mat2)
+f_mm,50,mm,Target focal length (= z-position of PV detector plane)
+mat1,N-BK7,,Entry layer material. Choose from: N-BK7 / F2 / SF11 / N-LASF9 / N-FK51A
+mat2,F2,,Exit layer material. Choose from: N-BK7 / F2 / SF11 / N-LASF9 / N-FK51A
+ray_radius_mm,1,mm,Input bundle aperture half-width
+n_rays,25,,Approximate number of rays in the input bundle (nearest perfect square used)
+lam_start_nm,400,nm,First wavelength in the simulation grid
+lam_end_nm,1100,nm,Last wavelength in the simulation grid
+lam_steps,15,,Number of wavelength samples
+opt_method,Nelder-Mead,,scipy.optimize minimisation method (e.g. Nelder-Mead / Powell / COBYLA)
+opt_maxiter,1500,,Maximum number of optimiser iterations
