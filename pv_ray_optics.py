@@ -12,6 +12,8 @@ Structure
 5. System builder      : build_layered_system() / build_nlayer_system()
                          (N layers), build_2layer_system() (legacy 2-layer)
 6. Optimizer           : optimize_lens()  (N-layer capable)
+6b. Auto-design        : generate_material_combinations(), auto_design()
+                         (joint material + geometry search)
 7. Unit tests          : run_tests()
 8. Visualization       : plot_spot_diagrams(), plot_focus_shift(),
                          plot_optimized_results()
@@ -19,6 +21,7 @@ Structure
 
 import csv
 import argparse
+import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -910,6 +913,178 @@ def optimize_lens(materials=None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6b. AUTO-DESIGN  (joint material + geometry search)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Jointly searches over material combinations *and* geometry, rather than
+# optimizing geometry for a fixed material choice (optimize_lens) or
+# screening materials at a fixed geometry (material_survey).
+#
+# Strategy:
+#   - Below `full_optimize_threshold` combinations: fully optimize every
+#     combination (cheap enough to just do the honest thing).
+#   - Above it: successive halving. Every combination gets a small
+#     iteration budget; the worse half is dropped; the survivors get a
+#     bigger budget (warm-started from where they left off); repeat for
+#     `halving_rounds` rounds. Whatever's left is trimmed to the best
+#     `top_k_final` and given a full-resolution optimize_lens() run for an
+#     honest final cost. No combination is judged on a single fixed-geometry
+#     snapshot the way material_survey's screening pass is — every
+#     candidate gets to move from its starting point before being cut.
+
+def generate_material_combinations(n_layers: int, material_names=None):
+    """
+    Ordered N-tuples of material names, excluding any combination with two
+    *adjacent* identical layers (that interface would do nothing optically —
+    n1 == n2 there). Non-adjacent repeats (e.g. layer 1 and layer 3 the same
+    in a 3-layer stack) are allowed.
+    """
+    if material_names is None:
+        material_names = list(CANDIDATE_MATERIALS.keys())
+
+    combos = []
+    for combo in itertools.product(material_names, repeat=n_layers):
+        if any(combo[i] == combo[i + 1] for i in range(len(combo) - 1)):
+            continue
+        combos.append(combo)
+    return combos
+
+
+def _halving_round_counts(n_combos, halving_rounds, top_k_final):
+    """Number of combinations optimized in each successive-halving round."""
+    counts = []
+    n = n_combos
+    for _ in range(halving_rounds):
+        counts.append(n)
+        n = max(top_k_final, n // 2)
+    counts.append(min(n, top_k_final))
+    return counts
+
+
+def auto_design(n_layers: int,
+                x0,
+                material_names=None,
+                lam_list=None,
+                rays_in=None,
+                method: str = "Nelder-Mead",
+                full_optimize_threshold: int = 40,
+                screen_maxiter: int = 30,
+                halving_rounds: int = 3,
+                top_k_final: int = 3,
+                final_maxiter: int = 500,
+                progress_callback=None) -> dict:
+    """
+    Jointly search material combinations and geometry for the best N-layer
+    design (see module strategy note above).
+
+    Parameters
+    ----------
+    n_layers                : number of layers to search over
+    x0                      : starting geometry [R0..Rn, t1..tn, f] (metres),
+                               used as the initial point for every combination
+    material_names          : candidate material names; defaults to all of
+                               CANDIDATE_MATERIALS
+    lam_list, rays_in       : as in optimize_lens(); defaults to
+                               LAMBDA_GRID / make_input_bundle()
+    method                  : scipy.optimize method
+    full_optimize_threshold : combinations at or below this count are fully
+                               optimized individually instead of halved
+    screen_maxiter          : iteration budget for round 1 of halving
+                               (doubles each subsequent round)
+    halving_rounds          : number of halving rounds before the final pass
+    top_k_final             : how many survivors get a full-resolution
+                               optimize_lens() run at the end
+    final_maxiter           : iteration budget for the full-optimize path and
+                               the final pass of the halving path
+    progress_callback       : optional callable(step:int, total:int, label:str)
+
+    Returns
+    -------
+    dict with keys:
+        'best'                     : optimize_lens()-style result dict for
+                                      the winning combination
+        'best_materials'           : list of material names for the winner
+        'leaderboard'              : list of {'materials','cost','params'}
+                                      dicts, best first
+        'n_combinations_total'     : number of combinations considered
+        'n_combinations_evaluated' : number of optimize_lens() calls made
+        'used_halving'             : whether the halving path was taken
+    """
+    combos = generate_material_combinations(n_layers, material_names)
+    n_combos = len(combos)
+    if n_combos == 0:
+        raise ValueError("No valid material combinations for this layer count.")
+
+    if lam_list is None:
+        lam_list = LAMBDA_GRID
+    if rays_in is None:
+        rays_in = make_input_bundle()
+
+    def _optimize_combo(combo, x_start, maxiter):
+        materials = [CANDIDATE_MATERIALS[name] for name in combo]
+        return optimize_lens(materials=materials, x0=x_start, method=method,
+                             maxiter=maxiter, lam_list=lam_list, rays_in=rays_in)
+
+    step = 0
+    used_halving = n_combos > full_optimize_threshold
+
+    if not used_halving:
+        total = n_combos
+        results = []
+        for combo in combos:
+            res = _optimize_combo(combo, x0, final_maxiter)
+            results.append((combo, res))
+            step += 1
+            if progress_callback is not None:
+                progress_callback(step, total, "/".join(combo))
+        results.sort(key=lambda cr: cr[1]["cost"])
+    else:
+        total = sum(_halving_round_counts(n_combos, halving_rounds, top_k_final))
+        history = {}
+        survivors = list(combos)
+
+        for r in range(halving_rounds):
+            budget = screen_maxiter * (2 ** r)
+            round_results = []
+            for combo in survivors:
+                x_start = history[combo]["params"] if combo in history else x0
+                res = _optimize_combo(combo, x_start, budget)
+                history[combo] = res
+                round_results.append((combo, res["cost"]))
+                step += 1
+                if progress_callback is not None:
+                    progress_callback(step, total, f"round {r + 1}: " + "/".join(combo))
+            round_results.sort(key=lambda cr: cr[1])
+            keep_n = max(top_k_final, len(round_results) // 2)
+            survivors = [combo for combo, _ in round_results[:keep_n]]
+
+        finalists = sorted(survivors, key=lambda c: history[c]["cost"])[:top_k_final]
+        results = []
+        for combo in finalists:
+            res = _optimize_combo(combo, history[combo]["params"], final_maxiter)
+            results.append((combo, res))
+            step += 1
+            if progress_callback is not None:
+                progress_callback(step, total, "final: " + "/".join(combo))
+        results.sort(key=lambda cr: cr[1]["cost"])
+
+    best_combo, best_res = results[0]
+    leaderboard = [
+        {"materials": list(combo), "cost": res["cost"], "params": res["params"]}
+        for combo, res in results
+    ]
+
+    return {
+        "best": best_res,
+        "best_materials": list(best_combo),
+        "leaderboard": leaderboard,
+        "n_combinations_total": n_combos,
+        "n_combinations_evaluated": step,
+        "used_halving": used_halving,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 6. UNIT TESTS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1075,6 +1250,47 @@ def run_tests():
     out3 = sys3.trace_bundle(fan3, 550e-9)
     assert len(out3) > 0, "FAIL [T13]: expected at least some rays to survive a 3-layer trace"
     print("  PASS [T13 3-layer build/trace sanity]")
+
+    # ── T14: generate_material_combinations excludes adjacent duplicates ───
+    names5 = list(CANDIDATE_MATERIALS.keys())
+    combos2 = generate_material_combinations(2, names5)
+    assert len(combos2) == len(names5) * (len(names5) - 1), (
+        "FAIL [T14]: expected all ordered pairs except same-material ones")
+    assert all(c[0] != c[1] for c in combos2), "FAIL [T14]: found an adjacent-duplicate pair"
+    combos3 = generate_material_combinations(3, ["A", "B"])
+    # A-B-A and B-A-B are the only 3-tuples over 2 names with no adjacent repeat
+    assert set(combos3) == {("A", "B", "A"), ("B", "A", "B")}, (
+        "FAIL [T14]: unexpected 3-layer combinations over 2 materials")
+    print(f"  PASS [T14 material combination generation ({len(combos2)} 2-layer pairs)]")
+
+    # ── T15: auto_design full-optimize path (small combo count) ────────────
+    x0_15 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    small_names = ["N-BK7", "F2"]  # -> exactly 2 valid combos for n_layers=2
+    ad15 = auto_design(
+        n_layers=2, x0=x0_15, material_names=small_names,
+        full_optimize_threshold=40, final_maxiter=25,
+    )
+    assert ad15["used_halving"] is False, "FAIL [T15]: expected the full-optimize path"
+    assert ad15["n_combinations_total"] == 2, "FAIL [T15]: expected exactly 2 combinations"
+    assert len(ad15["leaderboard"]) == 2, "FAIL [T15]: leaderboard should have one entry per combo"
+    assert np.isfinite(ad15["best"]["cost"]), "FAIL [T15]: best cost should be finite"
+    assert ad15["leaderboard"][0]["cost"] <= ad15["leaderboard"][1]["cost"], (
+        "FAIL [T15]: leaderboard should be sorted best-first")
+    print("  PASS [T15 auto_design full-optimize path]")
+
+    # ── T16: auto_design successive-halving path (forced via low threshold) ─
+    ad16 = auto_design(
+        n_layers=2, x0=x0_15, material_names=names5,
+        full_optimize_threshold=0,  # force halving even though 20 combos is small
+        screen_maxiter=5, halving_rounds=2, top_k_final=2, final_maxiter=20,
+    )
+    assert ad16["used_halving"] is True, "FAIL [T16]: expected the halving path"
+    assert ad16["n_combinations_total"] == len(combos2), (
+        "FAIL [T16]: combination count should match generate_material_combinations")
+    assert len(ad16["leaderboard"]) == 2, "FAIL [T16]: expected top_k_final=2 finalists"
+    assert np.isfinite(ad16["best"]["cost"]), "FAIL [T16]: best cost should be finite"
+    print(f"  PASS [T16 auto_design halving path "
+          f"({ad16['n_combinations_evaluated']} optimize_lens calls)]")
 
     print("\nAll tests PASSED.\n")
 

@@ -499,8 +499,8 @@ system = make_system(values)
 metrics_df, current_cost = per_wavelength_metrics(values)
 materials = get_materials(values)
 
-tab_analysis, tab_survey, tab_optimize, tab_export = st.tabs(
-    ["Analysis", "Material survey", "Optimize", "Export"]
+tab_analysis, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
+    ["Analysis", "Material survey", "Optimize", "Auto-design", "Export"]
 )
 
 with tab_analysis:
@@ -690,6 +690,163 @@ with tab_optimize:
 
         st.subheader("Optimized spot diagrams")
         st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
+
+with tab_auto:
+    st.write(
+        f"Jointly searches material combinations *and* geometry for the best "
+        f"{values['n_layers']}-layer design, using the current sidebar "
+        "geometry as the starting point for every combination."
+    )
+    st.caption(
+        "Uses the ray bundle, wavelength grid, and optimizer method configured "
+        "in the sidebar; the sidebar's \"Maximum iterations\" is reused as the "
+        "final-resolution iteration budget below."
+    )
+
+    all_combos = optics.generate_material_combinations(values["n_layers"])
+    n_combos = len(all_combos)
+
+    with st.expander("Advanced search settings"):
+        full_optimize_threshold = st.number_input(
+            "Full-optimize threshold — combinations at or below this count are "
+            "fully optimized individually; above it, successive halving is used",
+            min_value=1, value=40, step=1, key="auto_full_threshold",
+        )
+        screen_maxiter = st.number_input(
+            "Halving round-1 iteration budget (doubles each round)",
+            min_value=5, value=30, step=5, key="auto_screen_maxiter",
+        )
+        halving_rounds = st.number_input(
+            "Number of halving rounds", min_value=1, max_value=6, value=3, step=1,
+            key="auto_halving_rounds",
+        )
+        top_k_final = st.number_input(
+            "Finalists given a full-resolution pass", min_value=1, value=3, step=1,
+            key="auto_top_k",
+        )
+
+    will_halve = n_combos > full_optimize_threshold
+    st.caption(
+        f"{n_combos} candidate material combination(s) for {values['n_layers']} "
+        f"layer(s) — " + ("will use successive halving." if will_halve
+                           else "will fully optimize every combination.")
+    )
+
+    if st.button("Run auto-design", type="primary"):
+        progress_bar = st.progress(0, text="Starting search...")
+
+        def _report_auto_progress(step, total, label):
+            progress_bar.progress(min(step / total, 1.0), text=f"{step}/{total} — {label}")
+
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            ad_result = optics.auto_design(
+                n_layers=values["n_layers"],
+                x0=make_params(values),
+                lam_list=get_lambda_grid(values),
+                rays_in=get_rays_in(values),
+                method=values["opt_method"],
+                full_optimize_threshold=int(full_optimize_threshold),
+                screen_maxiter=int(screen_maxiter),
+                halving_rounds=int(halving_rounds),
+                top_k_final=int(top_k_final),
+                final_maxiter=int(values["opt_maxiter"]),
+                progress_callback=_report_auto_progress,
+            )
+
+        progress_bar.progress(1.0, text="Auto-design complete.")
+
+        n_layers_r = values["n_layers"]
+        best_params = ad_result["best"]["params"]
+        # Persisted in session_state so the results section below survives the
+        # rerun triggered by the "apply to sidebar" button (see the Optimize
+        # tab above for the same pattern and why it's needed).
+        st.session_state["auto_result"] = {
+            "n_layers": n_layers_r,
+            "radii_mm": (best_params[:n_layers_r + 1] * 1e3).tolist(),
+            "thicknesses_mm": (best_params[n_layers_r + 1:2 * n_layers_r + 1] * 1e3).tolist(),
+            "f_mm": float(best_params[2 * n_layers_r + 1] * 1e3),
+            "materials": ad_result["best_materials"],
+            "cost": ad_result["best"]["cost"],
+            "leaderboard": ad_result["leaderboard"],
+            "n_combinations_total": ad_result["n_combinations_total"],
+            "n_combinations_evaluated": ad_result["n_combinations_evaluated"],
+            "used_halving": ad_result["used_halving"],
+            "base_values": dict(values),
+            "console": capture.getvalue(),
+        }
+
+    auto_state = st.session_state.get("auto_result")
+    if auto_state is not None:
+        n_layers_r = auto_state["n_layers"]
+        radii_mm_r = auto_state["radii_mm"]
+        thicknesses_mm_r = auto_state["thicknesses_mm"]
+        f_mm_r = auto_state["f_mm"]
+
+        st.success(
+            f"Best design: {' / '.join(auto_state['materials'])} — searched "
+            f"{auto_state['n_combinations_evaluated']} of "
+            f"{auto_state['n_combinations_total']} combination(s)"
+            + (" via successive halving." if auto_state["used_halving"] else " (fully optimized).")
+        )
+
+        cols = st.columns(len(auto_state["materials"]) + 1)
+        for i, mname in enumerate(auto_state["materials"]):
+            cols[i].metric(f"Layer {i + 1}", mname)
+        cols[-1].metric("Best cost", f"{auto_state['cost']:.4e}")
+
+        param_rows = (
+            [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
+            + [{"Parameter": f"t{i + 1}", "Value (mm)": t} for i, t in enumerate(thicknesses_mm_r)]
+            + [{"Parameter": "f", "Value (mm)": f_mm_r}]
+        )
+        st.dataframe(
+            pd.DataFrame(param_rows).style.format({"Value (mm)": "{:+.4f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if st.button("Apply best design to sidebar"):
+            pending = {"n_layers": n_layers_r, "f_mm": f_mm_r}
+            for i, r in enumerate(radii_mm_r):
+                pending[f"R{i}_mm"] = float(r)
+            for i, t in enumerate(thicknesses_mm_r):
+                pending[f"t{i + 1}_mm"] = float(t)
+            for i, mname in enumerate(auto_state["materials"]):
+                pending[f"mat{i + 1}"] = mname
+            st.session_state["_apply_params"] = pending
+            st.rerun()
+
+        st.subheader("Leaderboard")
+        leaderboard_df = pd.DataFrame([
+            {"Materials": " / ".join(entry["materials"]), "Cost": entry["cost"]}
+            for entry in auto_state["leaderboard"]
+        ])
+        leaderboard_df["Cost"] = leaderboard_df["Cost"].map(lambda x: f"{x:.4e}")
+        st.dataframe(leaderboard_df, use_container_width=True, hide_index=True)
+
+        base_values = auto_state["base_values"]
+        best_values = dict(base_values)
+        best_values["n_layers"] = n_layers_r
+        best_values["radii_mm"] = radii_mm_r
+        best_values["thicknesses_mm"] = thicknesses_mm_r
+        best_values["f_mm"] = f_mm_r
+        best_values["materials"] = auto_state["materials"]
+
+        st.subheader("Best design — optical layout")
+        st.plotly_chart(plot_optical_layout_plotly(best_values), use_container_width=True, key="layout_auto")
+
+        st.subheader("Best design — RMS vs wavelength")
+        st.plotly_chart(
+            plot_rms_plotly([(best_values, "Best design", OPTIMIZED_COLOR)]),
+            use_container_width=True, key="rms_auto",
+        )
+
+        st.subheader("Best design — spot diagrams")
+        st.plotly_chart(plot_spots_plotly(best_values), use_container_width=True, key="spots_auto")
+
+        with st.expander("Console output"):
+            st.code(auto_state["console"][-5000:], language="text")
 
 with tab_export:
     st.download_button(
