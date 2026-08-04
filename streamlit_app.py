@@ -80,23 +80,23 @@ def _axis_id(idx, letter):
     return letter if n == 1 else f"{letter}{n}"
 
 
-@st.cache_resource(show_spinner=False)
-def _build_system(radii_mm, thicknesses_mm, material_names, f_mm):
-    materials = [optics.CANDIDATE_MATERIALS[name] for name in material_names]
-    radii = np.array(radii_mm, dtype=float) * 1e-3
-    thicknesses = np.array(thicknesses_mm, dtype=float) * 1e-3
-    return optics.build_layered_system(radii, thicknesses, materials, f_mm * 1e-3)
-
-
 def make_system(values):
-    # Cached on geometry + materials only, so tweaking ray/spectrum controls
-    # (which don't affect the system itself) never forces a rebuild.
-    return _build_system(
-        tuple(values["radii_mm"]),
-        tuple(values["thicknesses_mm"]),
-        tuple(values["materials"]),
-        values["f_mm"],
-    )
+    # Deliberately NOT cached: building a handful of Surface objects is
+    # cheap, and st.cache_resource shares the exact same live object across
+    # reruns/sessions rather than a copy. That's a real hazard here — if the
+    # physics classes it's built from (Ray/Surface/...) change in a later
+    # deploy but this function's own body doesn't, Streamlit has no way to
+    # know the cached object is now stale (its source-hash-based cache
+    # invalidation only sees *this* function's code, not build_layered_system
+    # or the classes underneath it). A stale cached system then produces
+    # Ray objects from the old class definition, silently missing whatever
+    # attributes were added later. The actually expensive step (ray tracing)
+    # is cached separately in trace_all_wavelengths(), whose own body does
+    # change whenever its logic does, so it self-invalidates correctly.
+    materials = get_materials(values)
+    radii = np.array(values["radii_mm"], dtype=float) * 1e-3
+    thicknesses = np.array(values["thicknesses_mm"], dtype=float) * 1e-3
+    return optics.build_layered_system(radii, thicknesses, materials, values["f_mm"] * 1e-3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
