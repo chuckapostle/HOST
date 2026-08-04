@@ -76,20 +76,34 @@ def ray_sphere_intersect(origin, direction, center, radius):
     return t, p, n
 
 
-def vector_snell(k_in, n_hat, n1, n2):
+def fresnel_transmittance(n1, n2, cos_i, cos_t):
     """
-    Refract a ray at an interface using the vector form of Snell's law.
+    Unpolarized-light Fresnel power transmittance for a single interface —
+    averages the s- and p-polarization reflectances (sunlight is
+    unpolarized, so this codebase doesn't track polarization state at all).
 
-    Parameters
-    ----------
-    k_in  : (3,) unit vector – incident ray direction
-    n_hat : (3,) unit vector – surface normal pointing from medium 1 → 2
-    n1    : float – index of incidence medium
-    n2    : float – index of transmission medium
+    cos_i, cos_t : cosines of the incidence / refraction angles (>= 0);
+                   scalar or array, matching n1/n2's usage site.
+    n1, n2       : refractive indices of the incidence / transmission media
 
     Returns
     -------
-    k_out : (3,) unit vector, or None if total internal reflection occurs
+    T : power transmittance, 1 - R (no absorption modeled)
+    """
+    rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)
+    rp = (n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i)
+    R = 0.5 * (rs**2 + rp**2)
+    return 1.0 - R
+
+
+def _snell_core(k_in, n_hat, n1, n2):
+    """
+    Shared implementation behind vector_snell() / vector_snell_T() — refract
+    via the vector form of Snell's law and compute the Fresnel transmittance
+    for the same interface in one pass (they need the same cos_i/cos_t).
+
+    Returns (k_out, T, ok). ok=False (k_out=None, T=0.0) on TIR or a
+    degenerate direction.
     """
     k_in  = np.asarray(k_in,  dtype=float)
     n_hat = np.asarray(n_hat, dtype=float)
@@ -105,13 +119,47 @@ def vector_snell(k_in, n_hat, n1, n2):
     k_sq = 1.0 - eta**2 * (1.0 - ci**2)  # cos²(θ_t)
 
     if k_sq < 0.0:
-        return None                        # total internal reflection
+        return None, 0.0, False            # total internal reflection
 
-    k_out = eta * k_in + (eta * ci - np.sqrt(k_sq)) * n_hat
+    cos_t = np.sqrt(k_sq)
+    k_out = eta * k_in + (eta * ci - cos_t) * n_hat
     norm  = np.linalg.norm(k_out)
     if norm < 1e-12:
-        return None
-    return k_out / norm
+        return None, 0.0, False
+
+    T = fresnel_transmittance(n1, n2, ci, cos_t)
+    return k_out / norm, T, True
+
+
+def vector_snell(k_in, n_hat, n1, n2):
+    """
+    Refract a ray at an interface using the vector form of Snell's law.
+
+    Parameters
+    ----------
+    k_in  : (3,) unit vector – incident ray direction
+    n_hat : (3,) unit vector – surface normal pointing from medium 1 → 2
+    n1    : float – index of incidence medium
+    n2    : float – index of transmission medium
+
+    Returns
+    -------
+    k_out : (3,) unit vector, or None if total internal reflection occurs
+    """
+    k_out, _T, ok = _snell_core(k_in, n_hat, n1, n2)
+    return k_out if ok else None
+
+
+def vector_snell_T(k_in, n_hat, n1, n2):
+    """
+    Like vector_snell(), but also returns the Fresnel power transmittance
+    of this interface (fraction of incident power that continues on with
+    the refracted ray; the rest is reflected, not absorbed).
+
+    Returns (k_out, T), or (None, 0.0) on total internal reflection.
+    """
+    k_out, T, ok = _snell_core(k_in, n_hat, n1, n2)
+    return (k_out, T) if ok else (None, 0.0)
 
 
 # ── 1.1  Vectorized (batch) counterparts ───────────────────────────────────
@@ -166,7 +214,8 @@ def _ray_sphere_intersect_batch(O, D, center, radius):
 
 def _vector_snell_batch(k_in, n_hat, n1, n2):
     """
-    Vectorized vector-form Snell's law.
+    Vectorized vector-form Snell's law, plus the per-ray Fresnel power
+    transmittance of the interface (see fresnel_transmittance()).
 
     k_in, n_hat : (N,3) arrays
     n1, n2      : scalars (index of incidence / transmission medium)
@@ -174,6 +223,7 @@ def _vector_snell_batch(k_in, n_hat, n1, n2):
     Returns
     -------
     k_out : (N,3) – refracted directions (only meaningful where ok=True)
+    T     : (N,)  – Fresnel power transmittance (only meaningful where ok=True)
     ok    : (N,) bool – False where total internal reflection occurs
     """
     eta = n1 / n2
@@ -195,7 +245,10 @@ def _vector_snell_batch(k_in, n_hat, n1, n2):
     norm_safe = np.where(norm < 1e-12, 1.0, norm)
     k_out = k_out / norm_safe[:, None]
 
-    return k_out, ok
+    T = np.zeros_like(ci)
+    T[ok] = fresnel_transmittance(n1, n2, ci[ok], sqrt_k[ok])
+
+    return k_out, T, ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -308,17 +361,21 @@ class Ray:
 
     Attributes
     ----------
-    o : (3,) ndarray – current origin
-    d : (3,) ndarray – unit direction
+    o     : (3,) ndarray – current origin
+    d     : (3,) ndarray – unit direction
+    power : float – fraction of incident power still carried by this ray,
+                    accumulated as the product of each interface's Fresnel
+                    transmittance (see Surface.refract). 1.0 = no losses yet.
     """
 
-    def __init__(self, origin, direction):
+    def __init__(self, origin, direction, power: float = 1.0):
         self.o = np.array(origin,    dtype=float)
         self.d = np.array(direction, dtype=float)
         norm   = np.linalg.norm(self.d)
         if norm < 1e-12:
             raise ValueError("Ray direction must be non-zero.")
         self.d /= norm
+        self.power = float(power)
 
     def at(self, t: float):
         """Point along the ray at parameter t."""
@@ -336,10 +393,10 @@ class Ray:
         return self
 
     def copy(self):
-        return Ray(self.o.copy(), self.d.copy())
+        return Ray(self.o.copy(), self.d.copy(), self.power)
 
     def __repr__(self):
-        return f"Ray(o={self.o}, d={self.d})"
+        return f"Ray(o={self.o}, d={self.d}, power={self.power:.4f})"
 
 
 # ── 2.3  Surface ──────────────────────────────────────────────────────────────
@@ -407,21 +464,22 @@ class Surface:
             n2 = self.mat_left.n(lam)
             n  = -n          # now points toward mat_left
 
-        k_out = vector_snell(ray.d, n, n1, n2)
+        k_out, T = vector_snell_T(ray.d, n, n1, n2)
         if k_out is None:
             return None     # TIR
 
-        return Ray(p, k_out)
+        return Ray(p, k_out, power=ray.power * T)
 
     # ── Vectorized refraction (batch of rays) ───────────────────────────────
-    def refract_batch(self, O, D, alive, lam, going_forward=True):
+    def refract_batch(self, O, D, power, alive, lam, going_forward=True):
         """
         Batch counterpart of refract(). O, D are (N,3) arrays of current
-        origins/directions; alive is an (N,) bool mask of rays still in
-        play. Rays that miss, or hit but TIR, become not-alive; their O/D
-        are left unchanged (never used again once dead).
+        origins/directions; power is an (N,) array of accumulated Fresnel
+        transmittance so far; alive is an (N,) bool mask of rays still in
+        play. Rays that miss, or hit but TIR, become not-alive; their
+        O/D/power are left unchanged (never used again once dead).
 
-        Returns (O_new, D_new, alive_new).
+        Returns (O_new, D_new, power_new, alive_new).
         """
         p, n, hit = _ray_sphere_intersect_batch(O, D, self.center, self.R)
         still = alive & hit
@@ -434,12 +492,13 @@ class Surface:
             n2 = self.mat_left.n(lam)
             n = -n
 
-        k_out, refr_ok = _vector_snell_batch(D, n, n1, n2)
+        k_out, T, refr_ok = _vector_snell_batch(D, n, n1, n2)
         still = still & refr_ok
 
         O_new = np.where(still[:, None], p, O)
         D_new = np.where(still[:, None], k_out, D)
-        return O_new, D_new, still
+        power_new = np.where(still, power * T, power)
+        return O_new, D_new, power_new, still
 
 
 # ── 2.4  LayeredLensSystem ────────────────────────────────────────────────────
@@ -490,10 +549,11 @@ class LayeredLensSystem:
 
         O = np.array([r.o for r in rays], dtype=float)
         D = np.array([r.d for r in rays], dtype=float)
+        power = np.array([r.power for r in rays], dtype=float)
         alive = np.ones(len(rays), dtype=bool)
 
         for surf in self.surfaces:
-            O, D, alive = surf.refract_batch(O, D, alive, lam, going_forward=going_forward)
+            O, D, power, alive = surf.refract_batch(O, D, power, alive, lam, going_forward=going_forward)
 
         Dz = D[:, 2]
         can_propagate = alive & (np.abs(Dz) >= 1e-12)
@@ -502,7 +562,7 @@ class LayeredLensSystem:
         O_final = O + t[:, None] * D
 
         return [
-            Ray(O_final[i], D[i])
+            Ray(O_final[i], D[i], power=power[i])
             for i in range(len(rays))
             if can_propagate[i]
         ]
@@ -513,28 +573,32 @@ class LayeredLensSystem:
         drawing an optical-layout / ray-fan diagram, not for bulk metrics
         (see trace_bundle() for the vectorized, metrics-oriented version).
 
-        Returns (points, alive):
+        Returns (points, alive, power):
             points : list of (3,) arrays — [origin, surface_1_hit, ...,
                      surface_N_hit, final_point]. If the ray is lost partway
                      through (miss/TIR), the list stops at the last point
                      reached (no final point on the target plane).
             alive  : True if the ray reached the target plane.
+            power  : accumulated Fresnel transmittance up to wherever the
+                     ray got to (1.0 = no losses yet; meaningless as a
+                     "power delivered" number when alive=False, since TIR
+                     redirects the ray rather than merely attenuating it).
         """
         points = [ray.o.copy()]
         cur = ray
         for surf in self.surfaces:
             nxt = surf.refract(cur, lam, going_forward=going_forward)
             if nxt is None:
-                return points, False
+                return points, False, cur.power
             points.append(nxt.o.copy())
             cur = nxt
 
         try:
             final = cur.copy().propagate_to_z(self.z_target)
         except ValueError:
-            return points, False
+            return points, False, cur.power
         points.append(final.o.copy())
-        return points, True
+        return points, True, final.power
 
     def find_paraxial_focus(self, lam: float, z_search=None, rays_in=None):
         """
@@ -566,15 +630,19 @@ class LayeredLensSystem:
 # 3. ILLUMINATION & METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_input_bundle(radius: float = 1e-3, n_rays: int = 25) -> list:
+def make_input_bundle(radius: float = 1e-3, n_rays: int = 25, tilt_deg: float = 0.0) -> list:
     """
-    Create a square grid of paraxial rays (direction +z) over a circular
-    aperture approximation.
+    Create a square grid of paraxial rays over a circular aperture
+    approximation, all traveling in the same direction.
 
     Parameters
     ----------
-    radius : aperture half-width [m]
-    n_rays : approximate total number of rays (nearest perfect square used)
+    radius   : aperture half-width [m]
+    n_rays   : approximate total number of rays (nearest perfect square used)
+    tilt_deg : incidence angle [deg] off the optical axis, tilted in the x-z
+               plane (0.0 = normal incidence, the historical default). Used
+               to sweep off-axis incidence for acceptance-angle analysis —
+               see acceptance_angle_scan().
 
     Returns
     -------
@@ -583,10 +651,12 @@ def make_input_bundle(radius: float = 1e-3, n_rays: int = 25) -> list:
     side = int(np.round(np.sqrt(n_rays)))
     xs   = np.linspace(-radius, radius, side)
     ys   = np.linspace(-radius, radius, side)
+    theta = np.radians(tilt_deg)
+    direction = [np.sin(theta), 0.0, np.cos(theta)]
     rays = []
     for x in xs:
         for y in ys:
-            rays.append(Ray(origin=[x, y, 0.0], direction=[0.0, 0.0, 1.0]))
+            rays.append(Ray(origin=[x, y, 0.0], direction=direction))
     return rays
 
 
@@ -629,6 +699,46 @@ def rms_spot_radius(rays) -> float:
     x   = pts[:, 0]
     y   = pts[:, 1]
     return float(np.sqrt(np.mean(x**2 + y**2)))
+
+
+def optical_efficiency(rays_out, n_rays_in: int) -> float:
+    """
+    Fraction of incident optical power that reaches the target plane,
+    accounting for Fresnel reflection losses at every interface (but not
+    where it lands — see power_within_radius() for that). Rays lost to a
+    miss or TIR contribute 0.
+
+    Parameters
+    ----------
+    rays_out  : list[Ray] – system.trace_bundle() output (already reflects
+                each surviving ray's accumulated .power)
+    n_rays_in : size of the illumination bundle that was traced (the
+                denominator — lost rays count as 0, not as absent)
+
+    Returns
+    -------
+    float in [0, 1]
+    """
+    if n_rays_in == 0:
+        return 0.0
+    return float(sum(r.power for r in rays_out) / n_rays_in)
+
+
+def power_within_radius(rays_out, radius: float, n_rays_in: int) -> float:
+    """
+    Like optical_efficiency(), but only counts power from rays landing
+    within `radius` of the optical axis at the target plane — i.e. power
+    actually collected by a PV cell of that radius, not just power that
+    reached the target plane somewhere. Used for acceptance-angle / CAP
+    analysis (see acceptance_angle_scan()).
+    """
+    if n_rays_in == 0 or not rays_out:
+        return 0.0
+    total = 0.0
+    for r in rays_out:
+        if np.hypot(r.o[0], r.o[1]) <= radius:
+            total += r.power
+    return total / n_rays_in
 
 
 def pv_weight(lam: float) -> float:
@@ -675,6 +785,116 @@ def concentration_cost(params, system_builder, lam_list=None, rays_in=None) -> f
         E  += pv_weight(lam) * rms**2
 
     return E
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b. ACCEPTANCE ANGLE / CAP
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A CPV concentrator's tolerance to tracking/pointing error is as important
+# as its on-axis spot size — a design with a tiny RMS spot but a razor-thin
+# acceptance angle is impractical to actually track. The standard figure of
+# merit combining both is the concentration-acceptance product (CAP):
+#
+#   CAP = sqrt(C_geo) * sin(theta_accept)
+#
+# where C_geo is the geometric concentration ratio (aperture area / cell
+# area) and theta_accept is the incidence angle at which collected power
+# (within the cell, Fresnel-loss-weighted) drops to 90% of its on-axis
+# value. Reference: Victoria et al., "The concentrator photovoltaics
+# module: A key focus area for optics research", Advanced Photonics 3(1),
+# 2021 — the CAP is defined there as the standard cross-technology CPV
+# optical figure of merit.
+
+def acceptance_angle_scan(system: LayeredLensSystem,
+                          lam: float,
+                          cell_radius: float,
+                          aperture_radius: float,
+                          n_rays: int = 25,
+                          theta_max_deg: float = 3.0,
+                          n_theta: int = 16):
+    """
+    Sweep incidence angle from 0 to theta_max_deg and, at each angle,
+    compute the fraction of incident power collected within `cell_radius`
+    of the axis at the target plane.
+
+    Returns
+    -------
+    dict with keys:
+        'thetas_deg'     : (n_theta,) array of scanned angles
+        'collected'      : (n_theta,) array of raw collected-power fractions
+        'collected_norm' : 'collected' normalized so collected_norm[0] == 1.0
+                           (i.e. relative to the on-axis value)
+    """
+    thetas = np.linspace(0.0, theta_max_deg, n_theta)
+    collected = np.zeros(n_theta)
+
+    for i, theta in enumerate(thetas):
+        rays_in = make_input_bundle(radius=aperture_radius, n_rays=n_rays, tilt_deg=theta)
+        rays_out = system.trace_bundle(rays_in, lam)
+        collected[i] = power_within_radius(rays_out, cell_radius, len(rays_in))
+
+    norm = collected[0] if collected[0] > 1e-12 else 1.0
+    return {
+        "thetas_deg": thetas,
+        "collected": collected,
+        "collected_norm": collected / norm,
+    }
+
+
+def find_acceptance_angle(thetas_deg, normalized_collected, threshold: float = 0.9):
+    """
+    First angle (linearly interpolated) at which normalized collected power
+    drops below `threshold` (default 0.9, the standard CPV definition).
+    Returns None if it never drops below threshold within the scanned range.
+    """
+    below = np.where(np.asarray(normalized_collected) < threshold)[0]
+    if len(below) == 0:
+        return None
+    i = below[0]
+    if i == 0:
+        return 0.0
+    x0, x1 = thetas_deg[i - 1], thetas_deg[i]
+    y0, y1 = normalized_collected[i - 1], normalized_collected[i]
+    frac = (threshold - y0) / (y1 - y0)
+    return float(x0 + frac * (x1 - x0))
+
+
+def concentration_acceptance_product(system: LayeredLensSystem,
+                                     lam: float,
+                                     cell_radius: float,
+                                     aperture_radius: float,
+                                     n_rays: int = 25,
+                                     theta_max_deg: float = 3.0,
+                                     n_theta: int = 16,
+                                     threshold: float = 0.9) -> dict:
+    """
+    Compute the concentration-acceptance product (CAP) for a system —
+    see the module note above this section.
+
+    Returns
+    -------
+    dict with keys 'C_geo', 'theta_accept_deg' (None if not found within the
+    scanned range), 'CAP' (None if theta_accept_deg is None), plus the raw
+    'thetas_deg' / 'collected' / 'collected_norm' arrays from the scan.
+    """
+    scan = acceptance_angle_scan(
+        system, lam, cell_radius, aperture_radius,
+        n_rays=n_rays, theta_max_deg=theta_max_deg, n_theta=n_theta,
+    )
+    theta_accept = find_acceptance_angle(scan["thetas_deg"], scan["collected_norm"], threshold)
+    c_geo = (aperture_radius / cell_radius) ** 2
+
+    cap = None
+    if theta_accept is not None:
+        cap = float(np.sqrt(c_geo) * np.sin(np.radians(theta_accept)))
+
+    return {
+        "C_geo": c_geo,
+        "theta_accept_deg": theta_accept,
+        "CAP": cap,
+        **scan,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1069,10 +1289,22 @@ def auto_design(n_layers: int,
         results.sort(key=lambda cr: cr[1]["cost"])
 
     best_combo, best_res = results[0]
-    leaderboard = [
-        {"materials": list(combo), "cost": res["cost"], "params": res["params"]}
-        for combo, res in results
-    ]
+    # Report an efficiency figure alongside cost, so a low-RMS combo that
+    # throws away a lot of light to Fresnel losses (e.g. a steep, high-index
+    # surface) doesn't look strictly better than it really is — the RMS-based
+    # cost that drove the search doesn't account for that at all.
+    leaderboard = []
+    for combo, res in results:
+        eff_vals = [
+            optical_efficiency(res["system"].trace_bundle(rays_in, lam), len(rays_in))
+            for lam in lam_list
+        ]
+        leaderboard.append({
+            "materials": list(combo),
+            "cost": res["cost"],
+            "params": res["params"],
+            "efficiency": float(np.mean(eff_vals)) if eff_vals else 0.0,
+        })
 
     return {
         "best": best_res,
@@ -1231,7 +1463,7 @@ def run_tests():
 
     # ── T12: trace_ray_path is consistent with trace_ray ───────────────────
     ray12 = Ray([0.5e-3, 0.3e-3, 0.0], [0.0, 0.0, 1.0])
-    pts12, alive12 = sys_new.trace_ray_path(ray12, 550e-9)
+    pts12, alive12, power12 = sys_new.trace_ray_path(ray12, 550e-9)
     ref12 = sys_new.trace_ray(ray12.copy(), 550e-9)
     assert alive12 == (ref12 is not None), "FAIL [T12]: alive flag disagrees with trace_ray"
     assert alive12, "FAIL [T12]: sanity check, expected ray to survive"
@@ -1239,6 +1471,8 @@ def run_tests():
         "FAIL [T12]: expected one point per surface plus origin and final point")
     _assert_close(np.max(np.abs(pts12[-1] - ref12.o)), 0.0, tol=1e-12,
                   label="T12 trace_ray_path final point matches trace_ray")
+    _assert_close(power12, ref12.power, tol=1e-12,
+                  label="T12 trace_ray_path power matches trace_ray")
 
     # ── T13: 3-layer system builds and traces successfully (sanity) ────────
     p3 = np.array([50e-3, -25e-3, -40e-3, -60e-3, 4e-3, 3e-3, 4e-3, 55e-3])
@@ -1276,6 +1510,8 @@ def run_tests():
     assert np.isfinite(ad15["best"]["cost"]), "FAIL [T15]: best cost should be finite"
     assert ad15["leaderboard"][0]["cost"] <= ad15["leaderboard"][1]["cost"], (
         "FAIL [T15]: leaderboard should be sorted best-first")
+    assert all(0.0 < e["efficiency"] <= 1.0 for e in ad15["leaderboard"]), (
+        "FAIL [T15]: leaderboard efficiency should be a plausible fraction")
     print("  PASS [T15 auto_design full-optimize path]")
 
     # ── T16: auto_design successive-halving path (forced via low threshold) ─
@@ -1291,6 +1527,54 @@ def run_tests():
     assert np.isfinite(ad16["best"]["cost"]), "FAIL [T16]: best cost should be finite"
     print(f"  PASS [T16 auto_design halving path "
           f"({ad16['n_combinations_evaluated']} optimize_lens calls)]")
+
+    # ── T17: Fresnel transmittance at normal incidence matches ((n1-n2)/(n1+n2))² ─
+    n1_17, n2_17 = 1.0, 1.5168  # air -> BK7
+    T17 = fresnel_transmittance(n1_17, n2_17, 1.0, 1.0)  # normal incidence: cos_i=cos_t=1
+    R_expected = ((n1_17 - n2_17) / (n1_17 + n2_17)) ** 2
+    _assert_close(T17, 1.0 - R_expected, tol=1e-12, label="T17 normal-incidence Fresnel transmittance")
+
+    # ── T18: identical media (n1==n2) transmit fully with an unbent ray ────
+    k_out18, T18 = vector_snell_T([0.1, 0.0, 0.995], [0.0, 0.0, 1.0], 1.5, 1.5)
+    assert k_out18 is not None, "FAIL [T18]: expected no TIR for identical media"
+    _assert_close(T18, 1.0, tol=1e-12, label="T18 identical-media transmittance == 1")
+    _assert_close(np.max(np.abs(np.asarray(k_out18) - np.array([0.1, 0.0, 0.995]) /
+                  np.linalg.norm([0.1, 0.0, 0.995]))), 0.0, tol=1e-12,
+                  label="T18 identical-media ray direction unchanged")
+
+    # ── T19: batch power tracking matches scalar reference (regression) ────
+    max_power_diff = 0.0
+    n_checked = 0
+    for r in test_rays:
+        ref = sys10.trace_ray(r.copy(), lam10)
+        got = sys10.trace_bundle([r.copy()], lam10)
+        if ref is not None:
+            assert len(got) == 1
+            max_power_diff = max(max_power_diff, abs(got[0].power - ref.power))
+            n_checked += 1
+    assert n_checked > 0, "FAIL [T19]: sanity check, no rays survived tracing"
+    assert all(0.0 < r.power <= 1.0 for r in sys10.trace_bundle(test_rays, lam10)), (
+        "FAIL [T19]: surviving ray power should be a plausible fraction")
+    _assert_close(max_power_diff, 0.0, tol=1e-9,
+                  label=f"T19 vectorized power matches scalar ({n_checked} rays)")
+
+    # ── T20: acceptance-angle scan / CAP — structural sanity ───────────────
+    scan20 = acceptance_angle_scan(
+        sys10, lam10, cell_radius=0.2e-3, aperture_radius=1e-3,
+        n_rays=16, theta_max_deg=2.0, n_theta=9,
+    )
+    assert np.all(np.diff(scan20["thetas_deg"]) > 0), "FAIL [T20]: angles should be increasing"
+    _assert_close(scan20["collected_norm"][0], 1.0, tol=1e-9,
+                  label="T20 on-axis normalized collection == 1.0")
+    cap20 = concentration_acceptance_product(
+        sys10, lam10, cell_radius=0.2e-3, aperture_radius=1e-3,
+        n_rays=16, theta_max_deg=2.0, n_theta=9,
+    )
+    assert cap20["C_geo"] > 0, "FAIL [T20]: C_geo should be positive"
+    if cap20["theta_accept_deg"] is not None:
+        assert 0.0 <= cap20["theta_accept_deg"] <= 2.0, "FAIL [T20]: acceptance angle out of scan range"
+        assert cap20["CAP"] is not None and cap20["CAP"] > 0, "FAIL [T20]: CAP should be positive when found"
+    print("  PASS [T20 acceptance-angle scan / CAP structural sanity]")
 
     print("\nAll tests PASSED.\n")
 

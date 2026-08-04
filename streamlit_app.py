@@ -26,6 +26,7 @@ DEFAULTS = {
     "n_layers": 2,
     "f_mm": 50.0,
     "ray_radius_mm": 1.0,
+    "cell_radius_mm": 0.2,
     "n_rays": 25,
     "lam_start_nm": 400.0,
     "lam_end_nm": 1100.0,
@@ -115,11 +116,13 @@ def trace_all_wavelengths(values):
 
     rms_um = np.full(len(lam_grid), np.nan)
     n_rays_out = np.zeros(len(lam_grid), dtype=int)
+    efficiency = np.zeros(len(lam_grid))
     spots_um = []
 
     for i, lam in enumerate(lam_grid):
         rays_out = system.trace_bundle(rays_in, lam)
         n_rays_out[i] = len(rays_out)
+        efficiency[i] = optics.optical_efficiency(rays_out, len(rays_in))
         if rays_out:
             pts = np.array([r.o for r in rays_out])[:, :2] * 1e6
             rms_um[i] = optics.rms_spot_radius(rays_out) * 1e6
@@ -131,6 +134,7 @@ def trace_all_wavelengths(values):
         "lam_m": lam_grid,
         "rms_um": rms_um,
         "n_rays_out": n_rays_out,
+        "efficiency": efficiency,
         "spots_um": spots_um,
     }
 
@@ -140,11 +144,12 @@ def per_wavelength_metrics(values):
     lam_grid = trace["lam_m"]
     rms_um = trace["rms_um"]
     n_rays_out = trace["n_rays_out"]
+    efficiency = trace["efficiency"]
 
     rows = []
     weighted_cost = 0.0
 
-    for lam, rms, n_out in zip(lam_grid, rms_um, n_rays_out):
+    for lam, rms, n_out, eff in zip(lam_grid, rms_um, n_rays_out, efficiency):
         weight = optics.pv_weight(lam)
         if np.isfinite(rms):
             weighted_cost += weight * (rms * 1e-6) ** 2
@@ -153,6 +158,7 @@ def per_wavelength_metrics(values):
                 "Wavelength (nm)": lam * 1e9,
                 "PV weight": weight,
                 "RMS spot radius (µm)": rms,
+                "Optical efficiency": eff,
                 "Rays reaching PV": int(n_out),
             }
         )
@@ -172,8 +178,8 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
     fan = optics.make_ray_fan(radius=aperture, n_rays=n_fan_rays)
     paths = []
     for ray in fan:
-        pts, alive = system.trace_ray_path(ray, lam_nm * 1e-9)
-        paths.append((np.array(pts), alive))
+        pts, alive, power = system.trace_ray_path(ray, lam_nm * 1e-9)
+        paths.append((np.array(pts), alive, power))
 
     surfaces = []
     for surf in system.surfaces:
@@ -278,12 +284,13 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
         ))
 
     n_paths = len(data["paths"])
-    for i, (pts, alive) in enumerate(data["paths"]):
+    for i, (pts, alive, power) in enumerate(data["paths"]):
         frac = i / max(n_paths - 1, 1)
         color = f"rgb({int(255 * frac)},80,{int(255 * (1 - frac))})"
         fig.add_trace(go.Scatter(
             x=pts[:, 2] * 1e3, y=pts[:, 0] * 1e3, mode="lines",
             line=dict(color=color, width=1.3, dash="solid" if alive else "dot"),
+            opacity=max(0.2, power),
             hoverinfo="skip", showlegend=False,
         ))
 
@@ -292,7 +299,8 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
         annotation_text="PV plane", annotation_position="top",
     )
     fig.update_layout(
-        title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm (dotted = lost ray)",
+        title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm "
+              "(dotted = lost ray, fainter = more Fresnel loss)",
         xaxis_title="z (mm)",
         yaxis_title="x (mm)",
         margin=dict(t=60, b=40),
@@ -342,6 +350,72 @@ def plot_focus_shift_plotly(system, lam_list, rays_in):
     return fig
 
 
+@st.cache_data(show_spinner=False)
+def compute_acceptance_scan(values, lam_nm=550.0, theta_max_deg=3.0, n_theta=16, threshold=0.9):
+    system = make_system(values)
+    return optics.concentration_acceptance_product(
+        system, lam_nm * 1e-9,
+        cell_radius=values["cell_radius_mm"] * 1e-3,
+        aperture_radius=values["ray_radius_mm"] * 1e-3,
+        n_rays=int(values["n_rays"]),
+        theta_max_deg=theta_max_deg, n_theta=n_theta, threshold=threshold,
+    )
+
+
+def plot_acceptance_plotly(scan):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=scan["thetas_deg"], y=scan["collected_norm"], mode="lines+markers",
+        line=dict(color=RMS_COLOR, width=2),
+        hovertemplate="%{x:.3f}°<br>%{y:.1%} of on-axis<extra></extra>",
+        name="Collected power",
+    ))
+    fig.add_hline(y=0.9, line=dict(color="red", dash="dot"), annotation_text="90% threshold")
+    if scan["theta_accept_deg"] is not None:
+        fig.add_vline(
+            x=scan["theta_accept_deg"], line=dict(color="green", dash="dot"),
+            annotation_text=f"acceptance = {scan['theta_accept_deg']:.3f}°",
+        )
+    title = f"Angular Acceptance — C_geo={scan['C_geo']:.1f}×"
+    if scan["CAP"] is not None:
+        title += f", CAP={scan['CAP']:.3f}"
+    fig.update_layout(
+        title=title,
+        xaxis_title="Incidence angle (deg)",
+        yaxis_title="Collected power (fraction of on-axis)",
+        yaxis=dict(range=[0, 1.05]),
+        margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def render_acceptance_expander(values, key_prefix):
+    """
+    Reusable "Angular acceptance (CAP)" expander — used identically in the
+    Analysis, Optimize, and Auto-design tabs, each with their own `values`
+    and a unique `key_prefix` (Streamlit needs unique widget/chart keys
+    across tabs, see the plotly_chart duplicate-ID note elsewhere).
+    """
+    with st.expander("Angular acceptance (CAP)"):
+        st.caption(
+            "Concentration-Acceptance Product: sweeps incidence angle and finds "
+            "where collected power (Fresnel-loss-weighted, within the PV cell "
+            "radius) drops to 90% of its on-axis value — the standard CPV "
+            "figure of merit combining concentration and angular tolerance."
+        )
+        if st.button("Calculate angular acceptance", type="secondary", key=f"{key_prefix}_accept_btn"):
+            with st.spinner("Scanning incidence angle..."):
+                scan = compute_acceptance_scan(values)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Geometric concentration", f"{scan['C_geo']:.1f}×")
+            c2.metric(
+                "Acceptance angle (90%)",
+                f"{scan['theta_accept_deg']:.3f}°" if scan["theta_accept_deg"] is not None else "> scan range",
+            )
+            c3.metric("CAP", f"{scan['CAP']:.3f}" if scan["CAP"] is not None else "—")
+            st.plotly_chart(plot_acceptance_plotly(scan), use_container_width=True, key=f"{key_prefix}_accept_fig")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,7 +428,7 @@ def flatten_values_for_export(values):
         rows.append({"parameter": f"t{i + 1}_mm", "value": t})
     for i, m in enumerate(values["materials"]):
         rows.append({"parameter": f"mat{i + 1}", "value": m})
-    for key in ("f_mm", "ray_radius_mm", "n_rays", "lam_start_nm",
+    for key in ("f_mm", "ray_radius_mm", "cell_radius_mm", "n_rays", "lam_start_nm",
                 "lam_end_nm", "lam_steps", "opt_method", "opt_maxiter"):
         rows.append({"parameter": key, "value": values[key]})
     return rows
@@ -442,6 +516,15 @@ with st.sidebar:
             value=DEFAULTS["n_rays"], key="n_rays",
         )
 
+        st.header("PV cell")
+        cell_radius_mm = st.number_input(
+            "Cell radius (mm)", min_value=0.001,
+            value=DEFAULTS["cell_radius_mm"], step=0.05, format="%.3f", key="cell_radius_mm",
+            help="Physical PV cell size at the target plane — used for the "
+                 "angular-acceptance / concentration-acceptance-product (CAP) "
+                 "analysis, distinct from the lens aperture above.",
+        )
+
         st.header("Spectrum")
         lam_start_nm = st.number_input(
             "Start wavelength (nm)", min_value=300.0, max_value=1500.0,
@@ -477,6 +560,7 @@ values = {
     "materials": materials_sel,
     "f_mm": f_mm,
     "ray_radius_mm": ray_radius_mm,
+    "cell_radius_mm": cell_radius_mm,
     "n_rays": n_rays,
     "lam_start_nm": lam_start_nm,
     "lam_end_nm": lam_end_nm,
@@ -504,13 +588,17 @@ tab_analysis, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
 )
 
 with tab_analysis:
-    cols = st.columns(len(materials) + 2)
+    cols = st.columns(len(materials) + 3)
     for i, mat in enumerate(materials):
         cols[i].metric(f"Layer {i + 1}", mat.name)
-    cols[-2].metric("Weighted cost", f"{current_cost:.3e}")
-    cols[-1].metric(
+    cols[-3].metric("Weighted cost", f"{current_cost:.3e}")
+    cols[-2].metric(
         "Mean RMS spot radius",
         f"{metrics_df['RMS spot radius (µm)'].mean():.2f} µm",
+    )
+    cols[-1].metric(
+        "Mean optical efficiency",
+        f"{metrics_df['Optical efficiency'].mean():.1%}",
     )
 
     st.subheader("Optical layout")
@@ -533,6 +621,7 @@ with tab_analysis:
                     "Wavelength (nm)": "{:.1f}",
                     "PV weight": "{:.1f}",
                     "RMS spot radius (µm)": "{:.3f}",
+                    "Optical efficiency": "{:.1%}",
                     "Rays reaching PV": "{:.0f}",
                 }
             ),
@@ -550,6 +639,8 @@ with tab_analysis:
                     system, get_lambda_grid(values), get_rays_in(values),
                 )
             st.plotly_chart(fig_focus, use_container_width=True, key="focus_shift_analysis")
+
+    render_acceptance_expander(values, "analysis")
 
 with tab_survey:
     if values["n_layers"] != 2:
@@ -643,10 +734,20 @@ with tab_optimize:
         thicknesses_mm_r = opt_state["thicknesses_mm"]
         f_mm_r = opt_state["f_mm"]
 
-        cols = st.columns(len(opt_state["materials"]) + 1)
+        base_values = opt_state["base_values"]
+        opt_values = dict(base_values)
+        opt_values["n_layers"] = n_layers_r
+        opt_values["radii_mm"] = radii_mm_r
+        opt_values["thicknesses_mm"] = thicknesses_mm_r
+        opt_values["f_mm"] = f_mm_r
+        opt_values["materials"] = opt_state["materials"]
+        opt_efficiency = trace_all_wavelengths(opt_values)["efficiency"].mean()
+
+        cols = st.columns(len(opt_state["materials"]) + 2)
         for i, mname in enumerate(opt_state["materials"]):
             cols[i].metric(f"Layer {i + 1}", mname)
-        cols[-1].metric("Final cost", f"{opt_state['cost']:.4e}")
+        cols[-2].metric("Final cost", f"{opt_state['cost']:.4e}")
+        cols[-1].metric("Mean optical efficiency", f"{opt_efficiency:.1%}")
 
         param_rows = (
             [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
@@ -668,14 +769,6 @@ with tab_optimize:
             st.session_state["_apply_params"] = pending
             st.rerun()
 
-        base_values = opt_state["base_values"]
-        opt_values = dict(base_values)
-        opt_values["n_layers"] = n_layers_r
-        opt_values["radii_mm"] = radii_mm_r
-        opt_values["thicknesses_mm"] = thicknesses_mm_r
-        opt_values["f_mm"] = f_mm_r
-        opt_values["materials"] = opt_state["materials"]
-
         st.plotly_chart(
             plot_rms_plotly([
                 (base_values, "Initial", INITIAL_COLOR),
@@ -690,6 +783,8 @@ with tab_optimize:
 
         st.subheader("Optimized spot diagrams")
         st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
+
+        render_acceptance_expander(opt_values, "optimize")
 
 with tab_auto:
     st.write(
@@ -790,10 +885,16 @@ with tab_auto:
             + (" via successive halving." if auto_state["used_halving"] else " (fully optimized).")
         )
 
-        cols = st.columns(len(auto_state["materials"]) + 1)
+        # leaderboard[0] is always the winning combo (results are sorted
+        # best-first before the leaderboard is built), so its efficiency can
+        # be reused directly instead of re-tracing.
+        best_efficiency = auto_state["leaderboard"][0]["efficiency"]
+
+        cols = st.columns(len(auto_state["materials"]) + 2)
         for i, mname in enumerate(auto_state["materials"]):
             cols[i].metric(f"Layer {i + 1}", mname)
-        cols[-1].metric("Best cost", f"{auto_state['cost']:.4e}")
+        cols[-2].metric("Best cost", f"{auto_state['cost']:.4e}")
+        cols[-1].metric("Optical efficiency", f"{best_efficiency:.1%}")
 
         param_rows = (
             [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
@@ -819,11 +920,18 @@ with tab_auto:
 
         st.subheader("Leaderboard")
         leaderboard_df = pd.DataFrame([
-            {"Materials": " / ".join(entry["materials"]), "Cost": entry["cost"]}
+            {
+                "Materials": " / ".join(entry["materials"]),
+                "Cost": entry["cost"],
+                "Optical efficiency": entry["efficiency"],
+            }
             for entry in auto_state["leaderboard"]
         ])
-        leaderboard_df["Cost"] = leaderboard_df["Cost"].map(lambda x: f"{x:.4e}")
-        st.dataframe(leaderboard_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            leaderboard_df.style.format({"Cost": "{:.4e}", "Optical efficiency": "{:.1%}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         base_values = auto_state["base_values"]
         best_values = dict(base_values)
@@ -844,6 +952,8 @@ with tab_auto:
 
         st.subheader("Best design — spot diagrams")
         st.plotly_chart(plot_spots_plotly(best_values), use_container_width=True, key="spots_auto")
+
+        render_acceptance_expander(best_values, "auto")
 
         with st.expander("Console output"):
             st.code(auto_state["console"][-5000:], language="text")
