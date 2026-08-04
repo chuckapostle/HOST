@@ -4,7 +4,8 @@ import contextlib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 import pv_ray_optics as optics
 
@@ -15,15 +16,15 @@ st.set_page_config(
     layout="wide",
 )
 
+MAX_LAYERS = 4
+# Length MAX_LAYERS+1 so there's always a sensible default for the exit radius too.
+DEFAULT_RADII_MM = [50.0, -30.0, -50.0, -70.0, -90.0]
+DEFAULT_THICKNESS_MM = 5.0
+DEFAULT_MATERIALS_CYCLE = ["N-BK7", "F2"]
+
 DEFAULTS = {
-    "R0_mm": 50.0,
-    "R1_mm": -30.0,
-    "R2_mm": -50.0,
-    "t1_mm": 5.0,
-    "t2_mm": 5.0,
+    "n_layers": 2,
     "f_mm": 50.0,
-    "mat1": "N-BK7",
-    "mat2": "F2",
     "ray_radius_mm": 1.0,
     "n_rays": 25,
     "lam_start_nm": 400.0,
@@ -33,26 +34,24 @@ DEFAULTS = {
     "opt_maxiter": 500,
 }
 
+RMS_COLOR = "#4C78A8"
+INITIAL_COLOR = "#E45756"
+OPTIMIZED_COLOR = "#4C78A8"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: values <-> physics objects
+# ─────────────────────────────────────────────────────────────────────────────
 
 def make_params(values):
-    return np.array(
-        [
-            values["R0_mm"],
-            values["R1_mm"],
-            values["R2_mm"],
-            values["t1_mm"],
-            values["t2_mm"],
-            values["f_mm"],
-        ],
-        dtype=float,
-    ) * 1e-3
+    radii = np.array(values["radii_mm"], dtype=float) * 1e-3
+    thicknesses = np.array(values["thicknesses_mm"], dtype=float) * 1e-3
+    f = values["f_mm"] * 1e-3
+    return np.concatenate([radii, thicknesses, [f]])
 
 
 def get_materials(values):
-    return (
-        optics.CANDIDATE_MATERIALS[values["mat1"]],
-        optics.CANDIDATE_MATERIALS[values["mat2"]],
-    )
+    return [optics.CANDIDATE_MATERIALS[name] for name in values["materials"]]
 
 
 def get_lambda_grid(values):
@@ -70,32 +69,45 @@ def get_rays_in(values):
     )
 
 
+def _wavelength_color(lam):
+    r, g, b = optics._wavelength_to_rgb(lam)
+    return f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"
+
+
+def _axis_id(idx, letter):
+    n = idx + 1
+    return letter if n == 1 else f"{letter}{n}"
+
+
 @st.cache_resource(show_spinner=False)
-def _build_system(R0_mm, R1_mm, R2_mm, t1_mm, t2_mm, f_mm, mat1_name, mat2_name):
-    mat1 = optics.CANDIDATE_MATERIALS[mat1_name]
-    mat2 = optics.CANDIDATE_MATERIALS[mat2_name]
-    params = np.array(
-        [R0_mm, R1_mm, R2_mm, t1_mm, t2_mm, f_mm], dtype=float
-    ) * 1e-3
-    return optics.build_2layer_system(params, mat1=mat1, mat2=mat2)
+def _build_system(radii_mm, thicknesses_mm, material_names, f_mm):
+    materials = [optics.CANDIDATE_MATERIALS[name] for name in material_names]
+    radii = np.array(radii_mm, dtype=float) * 1e-3
+    thicknesses = np.array(thicknesses_mm, dtype=float) * 1e-3
+    return optics.build_layered_system(radii, thicknesses, materials, f_mm * 1e-3)
 
 
 def make_system(values):
     # Cached on geometry + materials only, so tweaking ray/spectrum controls
     # (which don't affect the system itself) never forces a rebuild.
     return _build_system(
-        values["R0_mm"], values["R1_mm"], values["R2_mm"],
-        values["t1_mm"], values["t2_mm"], values["f_mm"],
-        values["mat1"], values["mat2"],
+        tuple(values["radii_mm"]),
+        tuple(values["thicknesses_mm"]),
+        tuple(values["materials"]),
+        values["f_mm"],
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cached tracing
+# ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def trace_all_wavelengths(values):
     """
     Trace the full ray bundle across the full wavelength grid once and cache
-    the numeric results. per_wavelength_metrics / plot_rms_custom /
-    plot_spots_custom all read from this instead of re-tracing separately.
+    the numeric results. per_wavelength_metrics / plot_rms_plotly /
+    plot_spots_plotly all read from this instead of re-tracing separately.
     """
     system = make_system(values)
     rays_in = get_rays_in(values)
@@ -148,31 +160,66 @@ def per_wavelength_metrics(values):
     return pd.DataFrame(rows), weighted_cost
 
 
-def plot_rms_custom(values, label="Current design", color="tab:blue"):
-    trace = trace_all_wavelengths(values)
-    lam_nm = trace["lam_m"] * 1e9
-    rms_um = trace["rms_um"]
+@st.cache_data(show_spinner=False)
+def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
+    """
+    Geometry (surface arc points) + a small ray fan traced through the full
+    path (not just the final PV-plane point), for the optical-layout diagram.
+    """
+    system = make_system(values)
+    aperture = values["ray_radius_mm"] * 1e-3
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(
-        lam_nm,
-        rms_um,
-        marker="o",
-        linewidth=1.8,
-        label=label,
-        color=color,
+    fan = optics.make_ray_fan(radius=aperture, n_rays=n_fan_rays)
+    paths = []
+    for ray in fan:
+        pts, alive = system.trace_ray_path(ray, lam_nm * 1e-9)
+        paths.append((np.array(pts), alive))
+
+    surfaces = []
+    for surf in system.surfaces:
+        R = surf.R
+        cx, cz = surf.center[0], surf.center[2]
+        half_ap = min(aperture * 1.3, abs(R) * 0.97) if R != 0 else aperture * 1.3
+        xs = np.linspace(-half_ap, half_ap, 60) + cx
+        sign = 1.0 if R >= 0 else -1.0
+        zs = cz - sign * np.sqrt(np.maximum(R ** 2 - (xs - cx) ** 2, 0.0))
+        surfaces.append((xs, zs))
+
+    return {"paths": paths, "surfaces": surfaces, "z_target": system.z_target}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotly figures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_rms_plotly(series):
+    """series: list of (values_dict, label, color) tuples."""
+    fig = go.Figure()
+    for values, label, color in series:
+        trace = trace_all_wavelengths(values)
+        fig.add_trace(go.Scatter(
+            x=trace["lam_m"] * 1e9,
+            y=trace["rms_um"],
+            mode="lines+markers",
+            name=label,
+            line=dict(color=color, width=2),
+            marker=dict(size=6),
+            hovertemplate=f"%{{x:.0f}} nm<br>RMS = %{{y:.3f}} µm<extra>{label}</extra>",
+        ))
+    fig.add_vrect(x0=500, x1=900, fillcolor="green", opacity=0.08, line_width=0,
+                  annotation_text="Peak PV band", annotation_position="top left")
+    fig.update_layout(
+        title="RMS Spot Radius at PV Plane",
+        xaxis_title="Wavelength (nm)",
+        yaxis_title="RMS spot radius (µm)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(t=60, b=40),
     )
-    ax.axvspan(500, 900, alpha=0.10, color="green", label="Peak PV band")
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel("RMS spot radius (µm)")
-    ax.set_title("RMS Spot Radius at PV Plane")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
     return fig
 
 
-def plot_spots_custom(values):
+def plot_spots_plotly(values):
     trace = trace_all_wavelengths(values)
     lam_grid = trace["lam_m"]
     rms_um = trace["rms_um"]
@@ -182,64 +229,149 @@ def plot_spots_custom(values):
     ncols = min(5, n_lam)
     nrows = int(np.ceil(n_lam / ncols))
 
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(3 * ncols, 3 * nrows),
-        squeeze=False,
-    )
-    fig.suptitle("Spot Diagrams at PV Plane", fontsize=14)
+    titles = [
+        f"{lam * 1e9:.0f} nm — RMS {rms:.2f} µm" if pts.shape[0] > 0
+        else f"{lam * 1e9:.0f} nm — no rays"
+        for lam, rms, pts in zip(lam_grid, rms_um, spots_um)
+    ]
+    fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
+                         horizontal_spacing=0.05, vertical_spacing=0.12)
 
-    for idx, lam in enumerate(lam_grid):
-        ax = axes[idx // ncols][idx % ncols]
-        pts = spots_um[idx]
-        color = optics._wavelength_to_rgb(lam)
-
+    for idx, (lam, pts) in enumerate(zip(lam_grid, spots_um)):
+        row, col = idx // ncols + 1, idx % ncols + 1
+        color = _wavelength_color(lam)
         if pts.shape[0] > 0:
-            ax.scatter(
-                pts[:, 0],
-                pts[:, 1],
-                s=20,
-                color=color,
-                alpha=0.85,
+            fig.add_trace(
+                go.Scatter(
+                    x=pts[:, 0], y=pts[:, 1], mode="markers",
+                    marker=dict(color=color, size=5, opacity=0.85),
+                    hovertemplate="x=%{x:.2f} µm<br>y=%{y:.2f} µm<extra></extra>",
+                    showlegend=False,
+                ),
+                row=row, col=col,
             )
-            ax.set_title(f"{lam * 1e9:.0f} nm\nRMS={rms_um[idx]:.2f} µm")
-        else:
-            ax.set_title(f"{lam * 1e9:.0f} nm\nNo rays")
-            ax.text(
-                0.5,
-                0.5,
-                "×",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color="red",
-                fontsize=24,
-            )
+        fig.update_xaxes(title_text="x (µm)", zeroline=True, row=row, col=col)
+        fig.update_yaxes(
+            title_text="y (µm)", zeroline=True,
+            scaleanchor=_axis_id(idx, "x"), scaleratio=1,
+            row=row, col=col,
+        )
 
-        ax.axhline(0, color="black", linewidth=0.5, alpha=0.4)
-        ax.axvline(0, color="black", linewidth=0.5, alpha=0.4)
-        ax.set_xlabel("x (µm)")
-        ax.set_ylabel("y (µm)")
-        ax.set_aspect("equal")
-        ax.grid(True, alpha=0.2)
-
-    for idx in range(n_lam, nrows * ncols):
-        axes[idx // ncols][idx % ncols].set_visible(False)
-
-    fig.tight_layout()
+    fig.update_layout(
+        title_text="Spot Diagrams at PV Plane",
+        showlegend=False,
+        height=280 * nrows,
+        margin=dict(t=80, b=40),
+    )
     return fig
 
 
-def params_csv(values):
-    rows = [{"parameter": key, "value": value} for key, value in values.items()]
-    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
+    data = compute_optical_layout(values, n_fan_rays=n_fan_rays, lam_nm=lam_nm)
+    fig = go.Figure()
 
+    for xs, zs in data["surfaces"]:
+        fig.add_trace(go.Scatter(
+            x=zs * 1e3, y=xs * 1e3, mode="lines",
+            line=dict(color="#4C78A8", width=2),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    n_paths = len(data["paths"])
+    for i, (pts, alive) in enumerate(data["paths"]):
+        frac = i / max(n_paths - 1, 1)
+        color = f"rgb({int(255 * frac)},80,{int(255 * (1 - frac))})"
+        fig.add_trace(go.Scatter(
+            x=pts[:, 2] * 1e3, y=pts[:, 0] * 1e3, mode="lines",
+            line=dict(color=color, width=1.3, dash="solid" if alive else "dot"),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    fig.add_vline(
+        x=data["z_target"] * 1e3, line=dict(color="red", dash="dot", width=1.5),
+        annotation_text="PV plane", annotation_position="top",
+    )
+    fig.update_layout(
+        title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm (dotted = lost ray)",
+        xaxis_title="z (mm)",
+        yaxis_title="x (mm)",
+        margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def plot_focus_shift_plotly(system, lam_list, rays_in):
+    z_nom = system.z_target
+    z_scan = np.linspace(z_nom * 0.5, z_nom * 2.0, 200)
+
+    focus_z, focus_rms = [], []
+    for lam in lam_list:
+        zf, rms = system.find_paraxial_focus(lam, z_search=z_scan, rays_in=rays_in)
+        focus_z.append(zf * 1e3)
+        focus_rms.append(rms * 1e6)
+
+    lam_nm = np.array(lam_list) * 1e9
+    colors = [_wavelength_color(l) for l in lam_list]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Longitudinal chromatic aberration", "Spot size at best focus"),
+    )
+    fig.add_trace(go.Scatter(
+        x=lam_nm, y=focus_z, mode="lines+markers",
+        marker=dict(color=colors, size=9),
+        line=dict(color="rgba(120,120,120,0.5)"),
+        hovertemplate="%{x:.0f} nm<br>z = %{y:.3f} mm<extra></extra>",
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=lam_nm, y=focus_rms, mode="lines+markers",
+        marker=dict(color=colors, size=9),
+        line=dict(color="rgba(120,120,120,0.5)"),
+        hovertemplate="%{x:.0f} nm<br>RMS = %{y:.3f} µm<extra></extra>",
+        showlegend=False,
+    ), row=1, col=2)
+
+    for c in (1, 2):
+        fig.add_vrect(x0=500, x1=900, fillcolor="green", opacity=0.08, line_width=0, row=1, col=c)
+
+    fig.update_xaxes(title_text="Wavelength (nm)")
+    fig.update_yaxes(title_text="Best-focus z (mm)", row=1, col=1)
+    fig.update_yaxes(title_text="RMS spot at best focus (µm)", row=1, col=2)
+    fig.update_layout(title_text="Chromatic Focus Shift", height=420, margin=dict(t=80, b=40))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Export
+# ─────────────────────────────────────────────────────────────────────────────
+
+def flatten_values_for_export(values):
+    rows = [{"parameter": "n_layers", "value": values["n_layers"]}]
+    for i, r in enumerate(values["radii_mm"]):
+        rows.append({"parameter": f"R{i}_mm", "value": r})
+    for i, t in enumerate(values["thicknesses_mm"]):
+        rows.append({"parameter": f"t{i + 1}_mm", "value": t})
+    for i, m in enumerate(values["materials"]):
+        rows.append({"parameter": f"mat{i + 1}", "value": m})
+    for key in ("f_mm", "ray_radius_mm", "n_rays", "lam_start_nm",
+                "lam_end_nm", "lam_steps", "opt_method", "opt_maxiter"):
+        rows.append({"parameter": key, "value": values[key]})
+    return rows
+
+
+def params_csv(values):
+    return pd.DataFrame(flatten_values_for_export(values)).to_csv(index=False).encode("utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.title("PV Concentrator Ray-Optics Engine")
 st.caption(
-    "Interactive analysis, material screening, and optimization of a "
-    "two-layer refractive concentrator lens."
+    "Interactive analysis, material screening, and optimization of an "
+    "N-layer refractive concentrator lens."
 )
 
 # Apply any pending "copy optimized params to sidebar" request *before* the
@@ -251,127 +383,84 @@ if "_apply_params" in st.session_state:
         st.session_state[_key] = _val
 
 with st.sidebar:
+    st.header("Lens geometry")
+    n_layers = st.number_input(
+        "Number of layers",
+        min_value=1,
+        max_value=MAX_LAYERS,
+        value=DEFAULTS["n_layers"],
+        step=1,
+        key="n_layers",
+        help="Reacts immediately (outside the form below) so field count "
+             "updates without needing to click Apply.",
+    )
+
     with st.form("controls_form"):
-        st.header("Lens geometry")
+        material_names_list = list(optics.CANDIDATE_MATERIALS.keys())
+        radii_mm, thicknesses_mm, materials_sel = [], [], []
 
-        values = {}
-        values["R0_mm"] = st.number_input(
-            "R0 — entry curvature (mm)",
-            value=DEFAULTS["R0_mm"],
-            step=1.0,
-            format="%.3f",
-            key="R0_mm",
-        )
-        values["R1_mm"] = st.number_input(
-            "R1 — internal curvature (mm)",
-            value=DEFAULTS["R1_mm"],
-            step=1.0,
-            format="%.3f",
-            key="R1_mm",
-        )
-        values["R2_mm"] = st.number_input(
-            "R2 — exit curvature (mm)",
-            value=DEFAULTS["R2_mm"],
-            step=1.0,
-            format="%.3f",
-            key="R2_mm",
-        )
-        values["t1_mm"] = st.number_input(
-            "Layer 1 thickness (mm)",
-            min_value=0.5,
-            value=DEFAULTS["t1_mm"],
-            step=0.25,
-            format="%.3f",
-            key="t1_mm",
-        )
-        values["t2_mm"] = st.number_input(
-            "Layer 2 thickness (mm)",
-            min_value=0.5,
-            value=DEFAULTS["t2_mm"],
-            step=0.25,
-            format="%.3f",
-            key="t2_mm",
-        )
-        values["f_mm"] = st.number_input(
-            "PV plane / target focal length (mm)",
-            min_value=1.0,
-            value=DEFAULTS["f_mm"],
-            step=1.0,
-            format="%.3f",
-            key="f_mm",
-        )
+        for i in range(n_layers):
+            st.markdown(f"**Layer {i + 1}**")
+            r_label = "R0 — entry curvature (mm)" if i == 0 else f"R{i} — internal curvature (mm)"
+            r_default = DEFAULT_RADII_MM[i] if i < len(DEFAULT_RADII_MM) else DEFAULT_RADII_MM[-1]
+            r = st.number_input(r_label, value=r_default, step=1.0, format="%.3f", key=f"R{i}_mm")
+            radii_mm.append(r)
 
-        st.header("Materials")
-        material_names = list(optics.CANDIDATE_MATERIALS.keys())
-        values["mat1"] = st.selectbox(
-            "Layer 1 / entry material",
-            material_names,
-            index=material_names.index(DEFAULTS["mat1"]),
-            key="mat1",
+            t = st.number_input(
+                f"Layer {i + 1} thickness (mm)", min_value=0.5,
+                value=DEFAULT_THICKNESS_MM, step=0.25, format="%.3f", key=f"t{i + 1}_mm",
+            )
+            thicknesses_mm.append(t)
+
+            mat_default = DEFAULT_MATERIALS_CYCLE[i % len(DEFAULT_MATERIALS_CYCLE)]
+            m = st.selectbox(
+                f"Layer {i + 1} material", material_names_list,
+                index=material_names_list.index(mat_default), key=f"mat{i + 1}",
+            )
+            materials_sel.append(m)
+
+        r_exit_default = DEFAULT_RADII_MM[n_layers] if n_layers < len(DEFAULT_RADII_MM) else DEFAULT_RADII_MM[-1]
+        r_exit = st.number_input(
+            f"R{n_layers} — exit curvature (mm)", value=r_exit_default,
+            step=1.0, format="%.3f", key=f"R{n_layers}_mm",
         )
-        values["mat2"] = st.selectbox(
-            "Layer 2 / exit material",
-            material_names,
-            index=material_names.index(DEFAULTS["mat2"]),
-            key="mat2",
+        radii_mm.append(r_exit)
+
+        f_mm = st.number_input(
+            "PV plane / target focal length (mm)", min_value=1.0,
+            value=DEFAULTS["f_mm"], step=1.0, format="%.3f", key="f_mm",
         )
 
         st.header("Ray bundle")
-        values["ray_radius_mm"] = st.number_input(
-            "Aperture half-width (mm)",
-            min_value=0.01,
-            value=DEFAULTS["ray_radius_mm"],
-            step=0.05,
-            format="%.3f",
-            key="ray_radius_mm",
+        ray_radius_mm = st.number_input(
+            "Aperture half-width (mm)", min_value=0.01,
+            value=DEFAULTS["ray_radius_mm"], step=0.05, format="%.3f", key="ray_radius_mm",
         )
-        values["n_rays"] = st.select_slider(
+        n_rays = st.select_slider(
             "Approximate number of rays",
             options=[9, 16, 25, 36, 49, 64, 81, 100],
-            value=DEFAULTS["n_rays"],
-            key="n_rays",
+            value=DEFAULTS["n_rays"], key="n_rays",
         )
 
         st.header("Spectrum")
-        values["lam_start_nm"] = st.number_input(
-            "Start wavelength (nm)",
-            min_value=300.0,
-            max_value=1500.0,
-            value=DEFAULTS["lam_start_nm"],
-            step=10.0,
-            key="lam_start_nm",
+        lam_start_nm = st.number_input(
+            "Start wavelength (nm)", min_value=300.0, max_value=1500.0,
+            value=DEFAULTS["lam_start_nm"], step=10.0, key="lam_start_nm",
         )
-        values["lam_end_nm"] = st.number_input(
-            "End wavelength (nm)",
-            min_value=300.0,
-            max_value=1500.0,
-            value=DEFAULTS["lam_end_nm"],
-            step=10.0,
-            key="lam_end_nm",
+        lam_end_nm = st.number_input(
+            "End wavelength (nm)", min_value=300.0, max_value=1500.0,
+            value=DEFAULTS["lam_end_nm"], step=10.0, key="lam_end_nm",
         )
-        values["lam_steps"] = st.slider(
-            "Wavelength samples",
-            min_value=3,
-            max_value=31,
-            value=DEFAULTS["lam_steps"],
-            step=2,
-            key="lam_steps",
+        lam_steps = st.slider(
+            "Wavelength samples", min_value=3, max_value=31,
+            value=DEFAULTS["lam_steps"], step=2, key="lam_steps",
         )
 
         st.header("Optimization")
-        values["opt_method"] = st.selectbox(
-            "Optimizer",
-            ["Nelder-Mead", "Powell"],
-            index=0,
-            key="opt_method",
-        )
-        values["opt_maxiter"] = st.slider(
-            "Maximum iterations",
-            min_value=50,
-            max_value=2000,
-            value=DEFAULTS["opt_maxiter"],
-            step=50,
-            key="opt_maxiter",
+        opt_method = st.selectbox("Optimizer", ["Nelder-Mead", "Powell"], index=0, key="opt_method")
+        opt_maxiter = st.slider(
+            "Maximum iterations", min_value=50, max_value=2000,
+            value=DEFAULTS["opt_maxiter"], step=50, key="opt_maxiter",
         )
 
         st.form_submit_button("Apply settings", type="primary", use_container_width=True)
@@ -381,11 +470,26 @@ with st.sidebar:
         "sliders no longer re-traces the whole system on every step."
     )
 
+values = {
+    "n_layers": n_layers,
+    "radii_mm": radii_mm,
+    "thicknesses_mm": thicknesses_mm,
+    "materials": materials_sel,
+    "f_mm": f_mm,
+    "ray_radius_mm": ray_radius_mm,
+    "n_rays": n_rays,
+    "lam_start_nm": lam_start_nm,
+    "lam_end_nm": lam_end_nm,
+    "lam_steps": lam_steps,
+    "opt_method": opt_method,
+    "opt_maxiter": opt_maxiter,
+}
+
 if values["lam_end_nm"] <= values["lam_start_nm"]:
     st.error("The end wavelength must be greater than the start wavelength.")
     st.stop()
 
-if values["mat1"] == values["mat2"]:
+if values["n_layers"] == 2 and values["materials"][0] == values["materials"][1]:
     st.warning(
         "The material survey excludes pairs with identical materials. "
         "Direct analysis remains valid."
@@ -393,28 +497,33 @@ if values["mat1"] == values["mat2"]:
 
 system = make_system(values)
 metrics_df, current_cost = per_wavelength_metrics(values)
-mat1, mat2 = get_materials(values)
+materials = get_materials(values)
 
 tab_analysis, tab_survey, tab_optimize, tab_export = st.tabs(
     ["Analysis", "Material survey", "Optimize", "Export"]
 )
 
 with tab_analysis:
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Layer 1", mat1.name)
-    col2.metric("Layer 2", mat2.name)
-    col3.metric("Weighted cost", f"{current_cost:.3e}")
-    col4.metric(
+    cols = st.columns(len(materials) + 2)
+    for i, mat in enumerate(materials):
+        cols[i].metric(f"Layer {i + 1}", mat.name)
+    cols[-2].metric("Weighted cost", f"{current_cost:.3e}")
+    cols[-1].metric(
         "Mean RMS spot radius",
         f"{metrics_df['RMS spot radius (µm)'].mean():.2f} µm",
     )
 
+    st.subheader("Optical layout")
+    st.plotly_chart(plot_optical_layout_plotly(values), use_container_width=True, key="layout_analysis")
+
     left, right = st.columns([1.1, 1])
 
     with left:
-        rms_fig = plot_rms_custom(values)
-        st.pyplot(rms_fig)
-        plt.close(rms_fig)
+        st.plotly_chart(
+            plot_rms_plotly([(values, "Current design", RMS_COLOR)]),
+            use_container_width=True,
+            key="rms_analysis",
+        )
 
     with right:
         st.subheader("Per-wavelength results")
@@ -432,48 +541,53 @@ with tab_analysis:
         )
 
     st.subheader("Spot diagrams")
-    spots_fig = plot_spots_custom(values)
-    st.pyplot(spots_fig)
-    plt.close(spots_fig)
+    st.plotly_chart(plot_spots_plotly(values), use_container_width=True, key="spots_analysis")
 
     with st.expander("Chromatic focus shift"):
         if st.button("Calculate focus shift", type="secondary"):
             with st.spinner("Scanning best-focus plane across wavelengths..."):
-                fig_focus = optics.plot_focus_shift(
-                    system,
-                    lam_list=get_lambda_grid(values),
-                    title=f"Chromatic Focus Shift — {mat1.name}/{mat2.name}",
+                fig_focus = plot_focus_shift_plotly(
+                    system, get_lambda_grid(values), get_rays_in(values),
                 )
-            st.pyplot(fig_focus)
-            plt.close(fig_focus)
+            st.plotly_chart(fig_focus, use_container_width=True, key="focus_shift_analysis")
 
 with tab_survey:
-    st.write(
-        "This screens every ordered pair of distinct catalog materials at the "
-        "current geometry, using the ray bundle and wavelength grid configured "
-        "in the sidebar. It is a screening step, not an optimized comparison."
-    )
-
-    if st.button("Run material survey", type="primary"):
-        with st.spinner("Evaluating material pairs..."):
-            scores = optics.material_survey(
-                make_params(values),
-                verbose=False,
-                lam_list=get_lambda_grid(values),
-                rays_in=get_rays_in(values),
-            )
-
-        survey_df = pd.DataFrame(
-            scores,
-            columns=["Cost", "Layer 1 material", "Layer 2 material"],
+    if values["n_layers"] != 2:
+        st.info(
+            "Material survey compares ordered pairs of materials for a "
+            "2-layer design. Set **Number of layers** to 2 in the sidebar "
+            "to use it."
         )
-        survey_df["Cost"] = survey_df["Cost"].map(lambda x: f"{x:.4e}")
-        st.dataframe(survey_df, use_container_width=True, hide_index=True)
+    else:
+        st.write(
+            "This screens every ordered pair of distinct catalog materials at the "
+            "current geometry, using the ray bundle and wavelength grid configured "
+            "in the sidebar. It is a screening step, not an optimized comparison."
+        )
+
+        if st.button("Run material survey", type="primary"):
+            with st.spinner("Evaluating material pairs..."):
+                scores = optics.material_survey(
+                    make_params(values),
+                    verbose=False,
+                    lam_list=get_lambda_grid(values),
+                    rays_in=get_rays_in(values),
+                )
+
+            survey_df = pd.DataFrame(
+                scores,
+                columns=["Cost", "Layer 1 material", "Layer 2 material"],
+            )
+            survey_df["Cost"] = survey_df["Cost"].map(lambda x: f"{x:.4e}")
+            st.dataframe(survey_df, use_container_width=True, hide_index=True)
 
 with tab_optimize:
     st.warning(
         "Optimization can be computationally expensive. Start with 200–500 "
-        "iterations, then increase only after confirming the design behavior."
+        "iterations, then increase only after confirming the design behavior. "
+        "More layers mean more free parameters, which the gradient-free "
+        "Nelder-Mead/Powell optimizers handle less reliably — keep an eye on "
+        "whether the run actually converges."
     )
     st.caption(
         "Uses the ray bundle and wavelength grid configured in the sidebar "
@@ -494,8 +608,7 @@ with tab_optimize:
         capture = io.StringIO()
         with contextlib.redirect_stdout(capture):
             result = optics.optimize_lens(
-                mat1=mat1,
-                mat2=mat2,
+                materials=materials,
                 x0=make_params(values),
                 method=values["opt_method"],
                 maxiter=int(values["opt_maxiter"]),
@@ -507,89 +620,76 @@ with tab_optimize:
         progress_bar.progress(1.0, text="Optimization complete.")
         console_box.code(capture.getvalue(), language="text")
 
+        n_layers_r = values["n_layers"]
+        params = result["params"]
         # Persisted in session_state (rather than kept as plain locals) so the
         # results section below survives the rerun triggered by the "apply to
         # sidebar" button, instead of vanishing because `st.button` is only
         # True on the run where it was actually clicked.
         st.session_state["opt_result"] = {
-            "params_mm": (result["params"] * 1e3).tolist(),
-            "mat1_name": result["mat1"].name,
-            "mat2_name": result["mat2"].name,
+            "n_layers": n_layers_r,
+            "radii_mm": (params[:n_layers_r + 1] * 1e3).tolist(),
+            "thicknesses_mm": (params[n_layers_r + 1:2 * n_layers_r + 1] * 1e3).tolist(),
+            "f_mm": float(params[2 * n_layers_r + 1] * 1e3),
+            "materials": list(values["materials"]),
             "cost": result["cost"],
             "base_values": dict(values),
         }
 
     opt_state = st.session_state.get("opt_result")
     if opt_state is not None:
-        opt_params_mm = opt_state["params_mm"]
+        n_layers_r = opt_state["n_layers"]
+        radii_mm_r = opt_state["radii_mm"]
+        thicknesses_mm_r = opt_state["thicknesses_mm"]
+        f_mm_r = opt_state["f_mm"]
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Optimized material 1", opt_state["mat1_name"])
-        c2.metric("Optimized material 2", opt_state["mat2_name"])
-        c3.metric("Final cost", f"{opt_state['cost']:.4e}")
+        cols = st.columns(len(opt_state["materials"]) + 1)
+        for i, mname in enumerate(opt_state["materials"]):
+            cols[i].metric(f"Layer {i + 1}", mname)
+        cols[-1].metric("Final cost", f"{opt_state['cost']:.4e}")
 
-        parameter_df = pd.DataFrame(
-            {
-                "Parameter": ["R0", "R1", "R2", "t1", "t2", "f"],
-                "Value (mm)": opt_params_mm,
-            }
+        param_rows = (
+            [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
+            + [{"Parameter": f"t{i + 1}", "Value (mm)": t} for i, t in enumerate(thicknesses_mm_r)]
+            + [{"Parameter": "f", "Value (mm)": f_mm_r}]
         )
         st.dataframe(
-            parameter_df.style.format({"Value (mm)": "{:+.4f}"}),
+            pd.DataFrame(param_rows).style.format({"Value (mm)": "{:+.4f}"}),
             use_container_width=True,
             hide_index=True,
         )
 
         if st.button("Apply optimized parameters to sidebar"):
-            st.session_state["_apply_params"] = dict(zip(
-                ["R0_mm", "R1_mm", "R2_mm", "t1_mm", "t2_mm", "f_mm"],
-                [float(v) for v in opt_params_mm],
-            ))
+            pending = {"n_layers": n_layers_r, "f_mm": f_mm_r}
+            for i, r in enumerate(radii_mm_r):
+                pending[f"R{i}_mm"] = float(r)
+            for i, t in enumerate(thicknesses_mm_r):
+                pending[f"t{i + 1}_mm"] = float(t)
+            st.session_state["_apply_params"] = pending
             st.rerun()
 
         base_values = opt_state["base_values"]
         opt_values = dict(base_values)
-        (
-            opt_values["R0_mm"],
-            opt_values["R1_mm"],
-            opt_values["R2_mm"],
-            opt_values["t1_mm"],
-            opt_values["t2_mm"],
-            opt_values["f_mm"],
-        ) = opt_params_mm
+        opt_values["n_layers"] = n_layers_r
+        opt_values["radii_mm"] = radii_mm_r
+        opt_values["thicknesses_mm"] = thicknesses_mm_r
+        opt_values["f_mm"] = f_mm_r
+        opt_values["materials"] = opt_state["materials"]
 
-        initial_fig = plot_rms_custom(
-            base_values,
-            label="Initial",
-            color="tab:red",
+        st.plotly_chart(
+            plot_rms_plotly([
+                (base_values, "Initial", INITIAL_COLOR),
+                (opt_values, "Optimized", OPTIMIZED_COLOR),
+            ]),
+            use_container_width=True,
+            key="rms_optimize",
         )
-        ax = initial_fig.axes[0]
-        opt_fig = plot_rms_custom(
-            opt_values,
-            label="Optimized",
-            color="tab:blue",
-        )
-        opt_ax = opt_fig.axes[0]
 
-        for line in opt_ax.lines:
-            ax.plot(
-                line.get_xdata(),
-                line.get_ydata(),
-                color="tab:blue",
-                marker="o",
-                label="Optimized",
-            )
-        plt.close(opt_fig)
-
-        ax.set_title("Initial vs Optimized RMS Spot Radius")
-        ax.legend()
-        st.pyplot(initial_fig)
-        plt.close(initial_fig)
+        st.subheader("Optimized optical layout")
+        st.plotly_chart(plot_optical_layout_plotly(opt_values), use_container_width=True, key="layout_optimize")
 
         st.subheader("Optimized spot diagrams")
-        opt_spots_fig = plot_spots_custom(opt_values)
-        st.pyplot(opt_spots_fig)
-        plt.close(opt_spots_fig)
+        st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
 
 with tab_export:
     st.download_button(

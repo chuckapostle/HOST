@@ -7,10 +7,11 @@ Structure
 ---------
 1. Physics primitives  : ray_sphere_intersect(), vector_snell()
 2. Objects             : Material, Ray, Surface, LayeredLensSystem
-3. Illumination        : make_input_bundle()
+3. Illumination        : make_input_bundle(), make_ray_fan()
 4. Metrics             : rms_spot_radius(), concentration_cost()
-5. System builder      : build_2layer_system(params)
-6. Optimizer           : optimize_lens()
+5. System builder      : build_layered_system() / build_nlayer_system()
+                         (N layers), build_2layer_system() (legacy 2-layer)
+6. Optimizer           : optimize_lens()  (N-layer capable)
 7. Unit tests          : run_tests()
 8. Visualization       : plot_spot_diagrams(), plot_focus_shift(),
                          plot_optimized_results()
@@ -503,7 +504,36 @@ class LayeredLensSystem:
             if can_propagate[i]
         ]
 
-    def find_paraxial_focus(self, lam: float, z_search=None):
+    def trace_ray_path(self, ray: Ray, lam: float, going_forward: bool = True):
+        """
+        Trace a single ray and record every point along its path — used for
+        drawing an optical-layout / ray-fan diagram, not for bulk metrics
+        (see trace_bundle() for the vectorized, metrics-oriented version).
+
+        Returns (points, alive):
+            points : list of (3,) arrays — [origin, surface_1_hit, ...,
+                     surface_N_hit, final_point]. If the ray is lost partway
+                     through (miss/TIR), the list stops at the last point
+                     reached (no final point on the target plane).
+            alive  : True if the ray reached the target plane.
+        """
+        points = [ray.o.copy()]
+        cur = ray
+        for surf in self.surfaces:
+            nxt = surf.refract(cur, lam, going_forward=going_forward)
+            if nxt is None:
+                return points, False
+            points.append(nxt.o.copy())
+            cur = nxt
+
+        try:
+            final = cur.copy().propagate_to_z(self.z_target)
+        except ValueError:
+            return points, False
+        points.append(final.o.copy())
+        return points, True
+
+    def find_paraxial_focus(self, lam: float, z_search=None, rays_in=None):
         """
         Scan z to find the z-plane that minimises RMS spot radius for lam.
         Returns (z_focus, rms_at_focus).
@@ -511,8 +541,9 @@ class LayeredLensSystem:
         if z_search is None:
             z_search = np.linspace(
                 self.z_target * 0.5, self.z_target * 2.0, 300)
+        if rays_in is None:
+            rays_in = make_input_bundle()
 
-        rays_in = make_input_bundle()
         best_z, best_rms = z_search[0], float("inf")
 
         for z in z_search:
@@ -554,6 +585,27 @@ def make_input_bundle(radius: float = 1e-3, n_rays: int = 25) -> list:
         for y in ys:
             rays.append(Ray(origin=[x, y, 0.0], direction=[0.0, 0.0, 1.0]))
     return rays
+
+
+def make_ray_fan(radius: float = 1e-3, n_rays: int = 9, y: float = 0.0) -> list:
+    """
+    Create a 1-D fan of paraxial rays spread along x at a fixed y (default
+    the y=0 meridional plane), for optical-layout / ray-fan diagrams —
+    as opposed to make_input_bundle()'s 2-D grid, which is meant for spot
+    size / RMS metrics.
+
+    Parameters
+    ----------
+    radius : aperture half-width [m]
+    n_rays : number of rays in the fan
+    y      : fixed y-coordinate [m] for every ray (0.0 = meridional plane)
+
+    Returns
+    -------
+    list[Ray]
+    """
+    xs = np.linspace(-radius, radius, max(int(n_rays), 2))
+    return [Ray(origin=[x, y, 0.0], direction=[0.0, 0.0, 1.0]) for x in xs]
 
 
 def rms_spot_radius(rays) -> float:
@@ -623,23 +675,86 @@ def concentration_cost(params, system_builder, lam_list=None, rays_in=None) -> f
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. SYSTEM BUILDER  (2-layer apochromatic doublet + singlet)
+# 4. SYSTEM BUILDER  (N-layer stack, air on both ends)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Layout (all distances in metres, z increases to the right):
+# Layout for n layers (all distances in metres, z increases to the right):
 #
-#   z=0       z=t1     z=t1+t2      z=t1+t2+t3
-#   |<-- air -->|<- mat1 ->|<-- mat2 -->|<--- air --->|
-#  S0         S1          S2          S3
+#   z=0        z=t1       z=t1+t2            z=sum(t)
+#   |<- air ->|<- mat1 ->|<- mat2 ->| ... |<- matN ->|<--- air --->|
+#  S0         S1         S2               S(n-1)    Sn
 #
-#   S0: entry surface  (air | mat1),  centre at (0,0, z0 + R0)
-#   S1: mid   surface  (mat1 | mat2), centre at (0,0, z1 + R1)
-#   S2: exit  surface  (mat2 | air),  centre at (0,0, z2 + R2)
+#   S0     : entry surface (air | mat1),   centre at (0,0, z0 + R0)
+#   S1..   : internal surfaces (mat_i | mat_{i+1})
+#   Sn     : exit surface (matN | air),    centre at (0,0, zn + Rn)
 #
-# params = [R0, R1, R2, t1, t2, f]
-#   R0, R1, R2 : radii of curvature [m]
-#   t1, t2     : thicknesses of mat1, mat2 [m]
-#   f          : target focal length ≈ z_target [m]
+# Flat parameter layout used by the optimizer: params = [R0..Rn, t1..tn, f]
+#   R0..Rn (n+1 values) : radii of curvature [m]
+#   t1..tn (n values)   : thickness of each material layer [m]
+#   f                   : target focal length / PV-plane z-position [m]
+
+MIN_LAYER_THICKNESS = 0.5e-3  # guard: keep layer thicknesses positive and sensible
+
+
+def build_layered_system(radii, thicknesses, materials, f) -> LayeredLensSystem:
+    """
+    Build an N-layer layered lens system (air on both ends).
+
+    Parameters
+    ----------
+    radii       : sequence of N+1 signed radii of curvature [m], one per
+                  surface (entry, N-1 internal, exit)
+    thicknesses : sequence of N thicknesses [m], one per material layer
+    materials   : sequence of N Material objects, one per layer
+    f           : target focal length / PV-plane z-position [m]
+    """
+    radii = np.asarray(radii, dtype=float)
+    n_layers = len(materials)
+    if len(radii) != n_layers + 1:
+        raise ValueError(
+            f"Expected {n_layers + 1} radii for {n_layers} layers, got {len(radii)}.")
+    if len(thicknesses) != n_layers:
+        raise ValueError(
+            f"Expected {n_layers} thicknesses for {n_layers} layers, got {len(thicknesses)}.")
+
+    thicknesses = [max(float(t), MIN_LAYER_THICKNESS) for t in thicknesses]
+
+    surfaces = []
+    z = 0.0
+    mat_left = AIR
+    for i in range(n_layers):
+        mat_right = materials[i]
+        center = np.array([0.0, 0.0, z + radii[i]])
+        surfaces.append(Surface(center, radii[i], mat_left, mat_right))
+        z += thicknesses[i]
+        mat_left = mat_right
+
+    # Exit surface back to air
+    center_exit = np.array([0.0, 0.0, z + radii[n_layers]])
+    surfaces.append(Surface(center_exit, radii[n_layers], mat_left, AIR))
+
+    return LayeredLensSystem(surfaces, z_target=f)
+
+
+def build_nlayer_system(params, materials) -> LayeredLensSystem:
+    """
+    Build a layered system from a flat parameter vector
+    [R0..Rn, t1..tn, f] and a list of N Material objects.
+    """
+    params = np.asarray(params, dtype=float)
+    n_layers = len(materials)
+    expected_len = 2 * n_layers + 2
+    if len(params) != expected_len:
+        raise ValueError(
+            f"Expected {expected_len} params for {n_layers} layers "
+            f"([R0..R{n_layers}, t1..t{n_layers}, f]), got {len(params)}.")
+
+    radii = params[:n_layers + 1]
+    thicknesses = params[n_layers + 1:2 * n_layers + 1]
+    f = params[2 * n_layers + 1]
+
+    return build_layered_system(radii, thicknesses, materials, f)
+
 
 def build_2layer_system(params,
                         mat1: Material = None,
@@ -648,43 +763,23 @@ def build_2layer_system(params,
     Build a 3-surface, 2-material layered lens system.
 
     Default materials: N-BK7 (crown) + F2 (flint) → achromatic base.
+    Thin wrapper around build_nlayer_system() kept for backward
+    compatibility with existing callers (CLI, older scripts, tests).
     """
     if mat1 is None:
         mat1 = Material.BK7()
     if mat2 is None:
         mat2 = Material.F2()
 
-    R0, R1, R2, t1, t2, f = params
-
-    # Guard: keep thicknesses positive and sensible
-    t1 = max(t1, 0.5e-3)
-    t2 = max(t2, 0.5e-3)
-
-    # Vertex z-positions
-    z0 = 0.0
-    z1 = z0 + t1
-    z2 = z1 + t2
-
-    # Sphere centres: for a paraxial lens, the centre of curvature is offset
-    # from the vertex along z by the radius.
-    c0 = np.array([0.0, 0.0, z0 + R0])
-    c1 = np.array([0.0, 0.0, z1 + R1])
-    c2 = np.array([0.0, 0.0, z2 + R2])
-
-    surfaces = [
-        Surface(c0, R0, AIR,  mat1),
-        Surface(c1, R1, mat1, mat2),
-        Surface(c2, R2, mat2, AIR),
-    ]
-
-    return LayeredLensSystem(surfaces, z_target=f)
+    return build_nlayer_system(params, [mat1, mat2])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. OPTIMISER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def optimize_lens(mat1: Material = None,
+def optimize_lens(materials=None,
+                  mat1: Material = None,
                   mat2: Material = None,
                   x0=None,
                   method: str = "Nelder-Mead",
@@ -693,12 +788,18 @@ def optimize_lens(mat1: Material = None,
                   rays_in=None,
                   progress_callback=None) -> dict:
     """
-    Minimise concentration_cost for a 2-layer doublet + singlet lens.
+    Minimise concentration_cost for an N-layer lens stack.
 
     Parameters
     ----------
-    mat1, mat2        : materials for the two layers
-    x0                : initial params [R0, R1, R2, t1, t2, f] (metres)
+    materials         : list of N Material objects, one per layer. Preferred
+                         interface for N != 2 layers.
+    mat1, mat2        : materials for the two layers — legacy 2-layer
+                         interface, kept for backward compatibility. Ignored
+                         if `materials` is given.
+    x0                : initial params [R0..Rn, t1..tn, f] (metres);
+                         required whenever the layer count isn't 2 (the
+                         2-layer case falls back to the historical default).
     method            : scipy.optimize method
     maxiter           : maximum optimiser iterations
     lam_list          : wavelength grid [m] used for the honest init/final
@@ -712,15 +813,25 @@ def optimize_lens(mat1: Material = None,
 
     Returns
     -------
-    dict with keys 'params', 'cost', 'result', 'system'
+    dict with keys 'params', 'cost', 'result', 'system', 'materials'
+    (plus, for backward compatibility, 'mat1'/'mat2' when there are
+    exactly 2 layers).
     """
-    if mat1 is None:
-        mat1 = Material.BK7()
-    if mat2 is None:
-        mat2 = Material.F2()
+    if materials is None:
+        if mat1 is None:
+            mat1 = Material.BK7()
+        if mat2 is None:
+            mat2 = Material.F2()
+        materials = [mat1, mat2]
+
+    n_layers = len(materials)
 
     if x0 is None:
-        x0 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+        if n_layers == 2:
+            x0 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+        else:
+            raise ValueError(
+                "x0 must be provided explicitly when len(materials) != 2.")
 
     if lam_list is None:
         lam_list = LAMBDA_GRID
@@ -728,7 +839,7 @@ def optimize_lens(mat1: Material = None,
         rays_in = make_input_bundle()
 
     def builder(p):
-        return build_2layer_system(p, mat1=mat1, mat2=mat2)
+        return build_nlayer_system(p, materials)
 
     # ── Fast coarse cost (fewer rays + coarser λ grid) used during search ──
     # Subsampled from the caller's own grid/bundle, capped at ~7 wavelengths
@@ -762,7 +873,8 @@ def optimize_lens(mat1: Material = None,
         if progress_callback is not None:
             progress_callback(n, maxiter)
 
-    print(f"\nOptimising {mat1.name} / {mat2.name} lens ...")
+    mat_names = " / ".join(m.name for m in materials)
+    print(f"\nOptimising {mat_names} lens ({n_layers} layer(s)) ...")
     init_cost = concentration_cost(
         x0, builder, lam_list=lam_list, rays_in=rays_in)  # full-res for display only
     print(f"  Initial cost : {init_cost:.6e}")
@@ -784,14 +896,17 @@ def optimize_lens(mat1: Material = None,
     print(f"  Final cost   : {final_cost:.6e}")
 
     system = builder(result.x)
-    return {
-        "params": result.x,
-        "cost":   final_cost,
-        "result": result,
-        "system": system,
-        "mat1":   mat1,
-        "mat2":   mat2,
+    out = {
+        "params":    result.x,
+        "cost":      final_cost,
+        "result":    result,
+        "system":    system,
+        "materials": materials,
     }
+    if n_layers == 2:
+        # Legacy keys, kept for callers written against the 2-layer API.
+        out["mat1"], out["mat2"] = materials[0], materials[1]
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -924,6 +1039,43 @@ def run_tests():
     _assert_close(max_diff_batch, 0.0, tol=1e-9,
                   label=f"T10b full-batch matches scalar ({len(ref_points)} rays)")
 
+    # ── T11: build_nlayer_system(n=2) == build_2layer_system (regression) ──
+    p6 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    mat1_11, mat2_11 = Material.BK7(), Material.F2()
+    sys_old = build_2layer_system(p6, mat1=mat1_11, mat2=mat2_11)
+    sys_new = build_nlayer_system(p6, [mat1_11, mat2_11])
+    assert len(sys_old.surfaces) == len(sys_new.surfaces) == 3, (
+        "FAIL [T11]: surface count mismatch")
+    for i, (s_old, s_new) in enumerate(zip(sys_old.surfaces, sys_new.surfaces)):
+        _assert_close(s_old.R, s_new.R, tol=1e-15, label=f"T11 surface {i} radius")
+        _assert_close(np.max(np.abs(s_old.center - s_new.center)), 0.0, tol=1e-15,
+                      label=f"T11 surface {i} center")
+        assert s_old.mat_left.name == s_new.mat_left.name, f"FAIL [T11]: surface {i} mat_left"
+        assert s_old.mat_right.name == s_new.mat_right.name, f"FAIL [T11]: surface {i} mat_right"
+    _assert_close(sys_old.z_target, sys_new.z_target, tol=1e-15, label="T11 z_target")
+
+    # ── T12: trace_ray_path is consistent with trace_ray ───────────────────
+    ray12 = Ray([0.5e-3, 0.3e-3, 0.0], [0.0, 0.0, 1.0])
+    pts12, alive12 = sys_new.trace_ray_path(ray12, 550e-9)
+    ref12 = sys_new.trace_ray(ray12.copy(), 550e-9)
+    assert alive12 == (ref12 is not None), "FAIL [T12]: alive flag disagrees with trace_ray"
+    assert alive12, "FAIL [T12]: sanity check, expected ray to survive"
+    assert len(pts12) == len(sys_new.surfaces) + 2, (
+        "FAIL [T12]: expected one point per surface plus origin and final point")
+    _assert_close(np.max(np.abs(pts12[-1] - ref12.o)), 0.0, tol=1e-12,
+                  label="T12 trace_ray_path final point matches trace_ray")
+
+    # ── T13: 3-layer system builds and traces successfully (sanity) ────────
+    p3 = np.array([50e-3, -25e-3, -40e-3, -60e-3, 4e-3, 3e-3, 4e-3, 55e-3])
+    mats3 = [Material.BK7(), Material.SF11(), Material.FK51A()]
+    sys3 = build_nlayer_system(p3, mats3)
+    assert len(sys3.surfaces) == 4, "FAIL [T13]: expected 4 surfaces for 3 layers"
+    fan3 = make_ray_fan(radius=2e-3, n_rays=9)
+    assert len(fan3) == 9, "FAIL [T13]: make_ray_fan returned wrong ray count"
+    out3 = sys3.trace_bundle(fan3, 550e-9)
+    assert len(out3) > 0, "FAIL [T13]: expected at least some rays to survive a 3-layer trace"
+    print("  PASS [T13 3-layer build/trace sanity]")
+
     print("\nAll tests PASSED.\n")
 
 
@@ -1006,6 +1158,7 @@ def plot_spot_diagrams(system: LayeredLensSystem,
 
 def plot_focus_shift(system: LayeredLensSystem,
                      lam_list=None,
+                     rays_in=None,
                      title: str = "Chromatic Focus Shift"):
     """
     Show how the best-focus z and RMS spot size vary with wavelength
@@ -1021,7 +1174,7 @@ def plot_focus_shift(system: LayeredLensSystem,
     focus_rms = []
 
     for lam in lam_list:
-        zf, rms = system.find_paraxial_focus(lam, z_search=z_scan)
+        zf, rms = system.find_paraxial_focus(lam, z_search=z_scan, rays_in=rays_in)
         focus_z.append(zf * 1e3)        # → mm
         focus_rms.append(rms * 1e6)     # → µm
 
@@ -1309,13 +1462,15 @@ def main():
     # ── Step 0: unit tests ────────────────────────────────────────────────
     run_tests()
 
+    rays_in = make_input_bundle(radius=ray_radius, n_rays=n_rays)
+
     # ── Step 1: single-wavelength focus scan (unoptimised doublet) ────────
     print("Building initial 2-layer lens system ...")
     sys0 = build_2layer_system(x0, mat1=init_mat1, mat2=init_mat2)
 
     print("Plotting chromatic focus shift (initial system) ...")
     fig_shift = plot_focus_shift(
-        sys0, lam_list=lam_grid,
+        sys0, lam_list=lam_grid, rays_in=rays_in,
         title=f"Chromatic Focus Shift – Initial {mat1_name}/{mat2_name}")
     fig_shift.savefig("focus_shift_initial.png", dpi=150)
     print("  Saved: focus_shift_initial.png")
@@ -1327,7 +1482,6 @@ def main():
     print("  Saved: spots_initial.png")
 
     # ── Step 2: material survey ───────────────────────────────────────────
-    rays_in = make_input_bundle(radius=ray_radius, n_rays=n_rays)
     scores = material_survey(x0, lam_list=lam_grid, rays_in=rays_in)
     best_cost, best_m1_name, best_m2_name = scores[0]
     best_m1 = CANDIDATE_MATERIALS[best_m1_name]
