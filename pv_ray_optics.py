@@ -650,13 +650,19 @@ class LayeredLensSystem:
     z_target : float          – z-coordinate of the detector / PV plane
     """
 
-    def __init__(self, surfaces, z_target: float):
+    def __init__(self, surfaces, z_target: float, secondary=None):
         self.surfaces = surfaces
         self.z_target = z_target
+        # Optional SecondaryConcentrator mounted on the PV cell — see that
+        # class. Not part of build_layered_system()'s signature since it's
+        # an independent add-on, not a lens geometry parameter: attach it
+        # directly, e.g. `system.secondary = SecondaryConcentrator(...)`.
+        self.secondary = secondary
 
     def trace_ray(self, ray: Ray, lam: float, going_forward: bool = True):
         """
-        Trace a single ray through all surfaces and propagate to z_target.
+        Trace a single ray through all surfaces and propagate to z_target
+        (through self.secondary first, if one is attached).
 
         Returns the final Ray (origin = impact point on PV plane), or None.
         """
@@ -665,6 +671,9 @@ class LayeredLensSystem:
             if new_ray is None:
                 return None
             ray = new_ray
+
+        if self.secondary is not None:
+            return self.secondary.trace_ray(ray, self.z_target - self.secondary.height)
 
         try:
             ray.propagate_to_z(self.z_target)
@@ -691,6 +700,17 @@ class LayeredLensSystem:
 
         for surf in self.surfaces:
             O, D, power, alive = surf.refract_batch(O, D, power, alive, lam, going_forward=going_forward)
+
+        if self.secondary is not None:
+            out = []
+            for i in range(len(rays)):
+                if not alive[i]:
+                    continue
+                nr = self.secondary.trace_ray(
+                    Ray(O[i], D[i], power=power[i]), self.z_target - self.secondary.height)
+                if nr is not None:
+                    out.append(nr)
+            return out
 
         Dz = D[:, 2]
         can_propagate = alive & (np.abs(Dz) >= 1e-12)
@@ -729,6 +749,14 @@ class LayeredLensSystem:
                 return points, False, cur.power
             points.append(nxt.o.copy())
             cur = nxt
+
+        if self.secondary is not None:
+            sec_points, alive, power = self.secondary.trace_path(
+                cur, self.z_target - self.secondary.height)
+            # sec_points[0] is the CPC's entrance point (cur propagated
+            # forward to it) — genuinely new, not yet in points.
+            points.extend(sec_points)
+            return points, alive, power
 
         try:
             final = cur.copy().propagate_to_z(self.z_target)
@@ -1129,6 +1157,223 @@ def concentration_acceptance_product(system: LayeredLensSystem,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3c. SECONDARY CONCENTRATOR (CPC)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A refractive primary alone forces a tradeoff between concentration and
+# angular tolerance (see the CAP note above) — a razor-thin acceptance angle
+# at high concentration is the expected, not broken, behaviour. The
+# standard fix in real CPV systems is a non-imaging *secondary* mounted
+# directly on the cell: a small mirrored funnel that accepts a wider cone
+# of angles than the cell alone would and reflects the edge rays inward
+# onto it. This models the classic ideal compound parabolic concentrator
+# (CPC) — see Winston, "Nonimaging Optics" — via the standard edge-ray
+# construction, ray-traced through a piecewise-conical (flat-facet)
+# approximation of its true parabolic wall, the same style of
+# approximation build_layered_system() already uses for Fresnel surfaces.
+
+def cpc_profile(a_exit: float, theta_c_rad: float, n: int = 200) -> dict:
+    """
+    Tabulated radial profile of an ideal CPC for the given exit (receiver)
+    radius and design half-acceptance angle.
+
+    Derived from the edge-ray construction: in meridional cross-section,
+    the wall is a parabola whose focus sits at the receiver's opposite
+    edge and whose own axis is tilted at theta_c from the CPC's axis, so
+    that a ray arriving anywhere on the wall at exactly theta_c off-axis
+    reflects to pass through that opposite edge — the defining property
+    that makes every ray within +/- theta_c reach the receiver in at most
+    one bounce.
+
+    Parameters
+    ----------
+    a_exit      : exit / receiver radius [m] (the PV cell radius)
+    theta_c_rad : design half-acceptance angle [rad], 0 < theta_c < pi/2
+    n           : number of profile points
+
+    Returns
+    -------
+    dict with 'a_exit', 'a_entrance', 'height', 'z_local' (ascending, 0 at
+    the entrance to 'height' at the receiver), 'rho' (aligned with
+    'z_local': a_entrance down to a_exit).
+    """
+    a = float(a_exit)
+    theta_c = float(theta_c_rad)
+    sin_t, cos_t = np.sin(theta_c), np.cos(theta_c)
+    a_entrance = a / sin_t
+    height = a * (1.0 + sin_t) * cos_t / sin_t ** 2
+
+    # alpha runs receiver (pi/2) -> entrance (pi - theta_c); see the
+    # derivation note in run_tests() T29 for how these closed forms were
+    # obtained and verified against the focal/reflective property directly.
+    alpha = np.linspace(np.pi / 2, np.pi - theta_c, n)
+    R = 2 * a * (1.0 + sin_t) / (1.0 + np.cos(alpha - theta_c))
+    rho = -a + R * np.sin(alpha)
+    z_local = height + R * np.cos(alpha)   # height at receiver -> 0 at entrance
+
+    # Flip to ascending z_local (entrance -> receiver), the order rays
+    # actually travel in and what np.interp / the marching code expects.
+    return {
+        "a_exit": a,
+        "a_entrance": float(a_entrance),
+        "height": float(height),
+        "z_local": z_local[::-1].copy(),
+        "rho": rho[::-1].copy(),
+    }
+
+
+class SecondaryConcentrator:
+    """
+    Ideal CPC mounted on the PV cell, widening the system's angular
+    acceptance at the cost of some reflection loss on rays that bounce off
+    its walls before reaching the cell.
+
+    Rotationally symmetric about the optical axis: entrance radius
+    a_entrance (facing the primary lens) narrowing to exit radius a_exit
+    (== the PV cell radius) over `height`. The true parabolic wall is
+    approximated as `n_segments` flat conical facets for ray tracing.
+
+    Parameters
+    ----------
+    a_exit       : exit (PV cell) radius [m]
+    theta_c_deg  : design half-acceptance angle [deg]
+    reflectivity : per-bounce power reflectance of the mirror wall (e.g.
+                   ~0.85-0.95 for a good specular coating; 1.0 = ideal
+                   lossless mirror)
+    n_segments   : number of flat facets approximating the parabolic wall
+    max_bounces  : bounce budget per ray before giving up on it as lost
+    """
+
+    def __init__(self, a_exit: float, theta_c_deg: float,
+                 reflectivity: float = 0.90, n_segments: int = 48,
+                 max_bounces: int = 15):
+        profile = cpc_profile(a_exit, np.radians(theta_c_deg), n=n_segments + 1)
+        self.a_exit = profile["a_exit"]
+        self.a_entrance = profile["a_entrance"]
+        self.height = profile["height"]
+        self.z_local = profile["z_local"]
+        self.rho = profile["rho"]
+        self.reflectivity = float(reflectivity)
+        self.max_bounces = int(max_bounces)
+
+    def _trace_local(self, x0, y0, dx, dy, dz, power0):
+        """
+        March a single ray, already at the CPC's entrance plane (z=0 in
+        local coordinates), through the wall facets via specular
+        reflection until it either reaches the receiver plane
+        (z=self.height, success), exits back out the entrance (z=0,
+        rejected), or exceeds the bounce budget (rejected).
+
+        Returns (points, alive, power, direction) — points is a list of
+        (x,y,z) tuples in local coordinates, starting at the entry point
+        and including every bounce; direction is the final (dx,dy,dz).
+        """
+        points = [(x0, y0, 0.0)]
+        if np.hypot(x0, y0) > self.a_entrance + 1e-12:
+            return points, False, power0, (dx, dy, dz)   # misses the concentrator's own mouth
+
+        x, y, z = x0, y0, 0.0
+        vx, vy, vz = dx, dy, dz
+        power = power0
+        z_arr, rho_arr = self.z_local, self.rho
+
+        for _ in range(self.max_bounces):
+            if vz > 1e-12:
+                t_boundary, boundary_z = (self.height - z) / vz, self.height
+            elif vz < -1e-12:
+                t_boundary, boundary_z = (0.0 - z) / vz, 0.0
+            else:
+                return points, False, power, (vx, vy, vz)   # parallel to the axis: never reaches either plane
+
+            lo_z, hi_z = min(z, boundary_z), max(z, boundary_z)
+            best_t, best_seg = t_boundary, None
+
+            for k in range(len(z_arr) - 1):
+                zk, zk1 = z_arr[k], z_arr[k + 1]
+                if zk1 < lo_z - 1e-9 or zk > hi_z + 1e-9:
+                    continue
+                dz_seg = zk1 - zk
+                if dz_seg < 1e-15:
+                    continue
+                m = (rho_arr[k + 1] - rho_arr[k]) / dz_seg
+                c = rho_arr[k] - m * zk
+
+                R0 = m * z + c
+                A = vx * vx + vy * vy - m * m * vz * vz
+                B = 2.0 * (x * vx + y * vy - R0 * m * vz)
+                C = x * x + y * y - R0 * R0
+
+                if abs(A) < 1e-14:
+                    if abs(B) < 1e-14:
+                        continue
+                    roots = [-C / B]
+                else:
+                    disc = B * B - 4.0 * A * C
+                    if disc < 0.0:
+                        continue
+                    sq = np.sqrt(disc)
+                    roots = [(-B - sq) / (2.0 * A), (-B + sq) / (2.0 * A)]
+
+                for t in roots:
+                    if t <= 1e-9 or t >= best_t:
+                        continue
+                    z_hit = z + t * vz
+                    if zk - 1e-9 <= z_hit <= zk1 + 1e-9:
+                        best_t, best_seg = t, (m, c)
+
+            x, y, z = x + best_t * vx, y + best_t * vy, z + best_t * vz
+            points.append((x, y, z))
+
+            if best_seg is None:
+                reached_receiver = boundary_z >= self.height - 1e-9
+                return points, reached_receiver, power, (vx, vy, vz)
+
+            m, c = best_seg
+            n = np.array([x, y, -m * (m * z + c)])
+            n_norm = np.linalg.norm(n)
+            if n_norm < 1e-12:
+                return points, False, power, (vx, vy, vz)
+            n /= n_norm
+            v = np.array([vx, vy, vz]) - 2.0 * (vx * n[0] + vy * n[1] + vz * n[2]) * n
+            v_norm = np.linalg.norm(v)
+            if v_norm < 1e-12:
+                return points, False, power, (vx, vy, vz)
+            vx, vy, vz = v / v_norm
+            power *= self.reflectivity
+            # Nudge off the facet along the new direction so it isn't
+            # immediately re-detected as the nearest hit next iteration.
+            x, y, z = x + vx * 1e-9, y + vy * 1e-9, z + vz * 1e-9
+
+        return points, False, power, (vx, vy, vz)   # exceeded the bounce budget
+
+    def trace_ray(self, ray: Ray, z_entrance: float):
+        """
+        Trace *ray* (anywhere along its line) through the concentrator,
+        whose entrance plane is at z=z_entrance. Returns the exit Ray (at
+        z = z_entrance + self.height), or None if lost.
+        """
+        cur = ray.copy().propagate_to_z(z_entrance)
+        pts, alive, power, direction = self._trace_local(
+            cur.o[0], cur.o[1], cur.d[0], cur.d[1], cur.d[2], cur.power)
+        if not alive:
+            return None
+        x, y, _ = pts[-1]
+        return Ray([x, y, z_entrance + self.height], direction, power=power)
+
+    def trace_path(self, ray: Ray, z_entrance: float):
+        """
+        Like trace_ray(), but returns (points, alive, power) with every
+        bounce point in global coordinates (z = z_entrance + z_local) —
+        for the optical-layout diagrams.
+        """
+        cur = ray.copy().propagate_to_z(z_entrance)
+        pts_local, alive, power, _ = self._trace_local(
+            cur.o[0], cur.o[1], cur.d[0], cur.d[1], cur.d[2], cur.power)
+        points = [np.array([x, y, z_entrance + z]) for x, y, z in pts_local]
+        return points, alive, power
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. SYSTEM BUILDER  (N-layer stack, air on both ends)
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -1266,6 +1511,7 @@ def optimize_lens(materials=None,
                   surface_types=None,
                   groove_pitches=None,
                   optimize_groove_pitch: bool = True,
+                  secondary=None,
                   progress_callback=None) -> dict:
     """
     Minimise concentration_cost for an N-layer lens stack.
@@ -1310,6 +1556,14 @@ def optimize_lens(materials=None,
                          it fits the same Nelder-Mead/Powell search as the
                          radii/thicknesses (unlike surface_type itself).
                          Default True.
+    secondary         : optional SecondaryConcentrator, attached to every
+                         candidate system during the search (and to the
+                         returned 'system') — lets the geometry search
+                         account for the secondary's wider angular
+                         acceptance rather than being optimized blind to
+                         it. Shared by reference across every candidate;
+                         safe since tracing never mutates it. None (default)
+                         matches the historical no-secondary behaviour.
     progress_callback : optional callable(iteration:int, maxiter:int),
                          invoked after every scipy.optimize iteration —
                          lets a caller (e.g. a UI) drive a progress bar.
@@ -1372,8 +1626,10 @@ def optimize_lens(materials=None,
 
     def builder(p):
         geom, pitches = _unpack(p)
-        return build_nlayer_system(geom, materials, surface_types=surface_types,
-                                   groove_pitches=pitches)
+        system = build_nlayer_system(geom, materials, surface_types=surface_types,
+                                     groove_pitches=pitches)
+        system.secondary = secondary
+        return system
 
     # ── Fast coarse cost (fewer rays + coarser λ grid) used during search ──
     # Subsampled from the caller's own grid/bundle, capped at ~7 wavelengths
@@ -1432,6 +1688,7 @@ def optimize_lens(materials=None,
     final_geom, final_pitches = _unpack(result.x)
     system = build_nlayer_system(final_geom, materials, surface_types=surface_types,
                                  groove_pitches=final_pitches)
+    system.secondary = secondary
     out = {
         "params":         final_geom,
         "cost":           final_cost,
@@ -1519,6 +1776,7 @@ def auto_design(n_layers: int,
                 groove_pitches=None,
                 optimize_groove_pitch: bool = True,
                 search_surface_types: bool = False,
+                secondary=None,
                 max_workers=1,
                 progress_callback=None) -> dict:
     """
@@ -1566,6 +1824,9 @@ def auto_design(n_layers: int,
                                5-surface one: x32) — the halving path handles
                                the extra combinations fine, but a run will
                                take proportionally longer. Default False.
+    secondary               : optional SecondaryConcentrator, passed straight
+                               through to optimize_lens() for every
+                               combination — see its docstring.
     max_workers             : combinations within a single round (or the
                                whole full-optimize pass) are independent of
                                each other, so *can* run concurrently via a
@@ -1637,7 +1898,7 @@ def auto_design(n_layers: int,
         return optimize_lens(materials=materials, x0=x_start, method=method,
                              maxiter=maxiter, lam_list=lam_list, rays_in=rays_in,
                              surface_types=list(surf_types), groove_pitches=pitch_start,
-                             optimize_groove_pitch=optimize_groove_pitch)
+                             optimize_groove_pitch=optimize_groove_pitch, secondary=secondary)
 
     step_counter = {"n": 0}
 
@@ -2301,6 +2562,95 @@ def run_tests():
         assert len(entry["groove_pitches"]) == 3
     print(f"  PASS [T28 auto_design search_surface_types "
           f"(winner: {'/'.join(ad28['best_surface_types'])})]")
+
+    # ── T29: cpc_profile() geometry sanity ────────────────────────────────
+    a29, theta29 = 0.2e-3, np.radians(15.0)
+    prof29 = cpc_profile(a29, theta29, n=50)
+    _assert_close(prof29["a_entrance"], a29 / np.sin(theta29), tol=1e-12,
+                 label="T29 entrance radius formula")
+    expected_h29 = a29 * (1 + np.sin(theta29)) * np.cos(theta29) / np.sin(theta29) ** 2
+    _assert_close(prof29["height"], expected_h29, tol=1e-12, label="T29 height formula")
+    _assert_close(prof29["z_local"][0], 0.0, tol=1e-12, label="T29 z_local starts at entrance")
+    _assert_close(prof29["z_local"][-1], prof29["height"], tol=1e-9, label="T29 z_local ends at receiver")
+    _assert_close(prof29["rho"][0], prof29["a_entrance"], tol=1e-9, label="T29 rho starts at a_entrance")
+    _assert_close(prof29["rho"][-1], prof29["a_exit"], tol=1e-9, label="T29 rho ends at a_exit")
+    assert np.all(np.diff(prof29["z_local"]) > 0), "FAIL [T29]: z_local should be strictly increasing"
+    assert np.all(np.diff(prof29["rho"]) <= 1e-15), "FAIL [T29]: rho should be non-increasing (funnel narrows)"
+    print("  PASS [T29 cpc_profile geometry]")
+
+    # ── T30: SecondaryConcentrator — on-axis ray passes straight through ───
+    cpc30 = SecondaryConcentrator(a_exit=0.2e-3, theta_c_deg=15.0, reflectivity=1.0)
+    ray30 = Ray([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+    out30 = cpc30.trace_ray(ray30, z_entrance=0.0)
+    assert out30 is not None, "FAIL [T30]: on-axis ray should reach the receiver"
+    _assert_close(out30.o[0], 0.0, tol=1e-9, label="T30 on-axis x")
+    _assert_close(out30.o[1], 0.0, tol=1e-9, label="T30 on-axis y")
+    _assert_close(out30.o[2], cpc30.height, tol=1e-6, label="T30 on-axis reaches receiver plane")
+    _assert_close(out30.power, 1.0, tol=1e-9, label="T30 on-axis power unchanged (no bounces)")
+
+    # ── T31: a ray well within the acceptance cone reaches the receiver,
+    #         landing inside the cell radius ──────────────────────────────
+    cpc31 = SecondaryConcentrator(a_exit=0.2e-3, theta_c_deg=15.0, reflectivity=0.9)
+    theta31 = np.radians(15.0 * 0.5)
+    x0_31 = 0.5 * cpc31.a_entrance
+    ray31 = Ray([x0_31, 0.0, 0.0], [np.sin(theta31), 0.0, np.cos(theta31)])
+    out31 = cpc31.trace_ray(ray31, z_entrance=0.0)
+    assert out31 is not None, "FAIL [T31]: ray within the design cone should reach the receiver"
+    assert np.hypot(out31.o[0], out31.o[1]) <= cpc31.a_exit + 1e-9, (
+        "FAIL [T31]: ray reaching the receiver must land within the exit radius")
+    assert 0.0 < out31.power <= 1.0, "FAIL [T31]: power should be attenuated but positive"
+    print("  PASS [T31 within-acceptance ray collected]")
+
+    # ── T32: a ray far outside the acceptance cone is rejected ─────────────
+    cpc32 = SecondaryConcentrator(a_exit=0.2e-3, theta_c_deg=10.0, reflectivity=0.9)
+    theta32 = np.radians(10.0 * 5.0)
+    ray32 = Ray([0.0, 0.0, 0.0], [np.sin(theta32), 0.0, np.cos(theta32)])
+    out32 = cpc32.trace_ray(ray32, z_entrance=0.0)
+    assert out32 is None, "FAIL [T32]: ray far outside the design cone should be rejected"
+    print("  PASS [T32 far-outside-acceptance ray rejected]")
+
+    # ── T33: attaching a secondary to a real system improves off-axis
+    #         collection at a fixed small cell radius (the whole point) ────
+    sys33 = build_2layer_system(np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3]))
+    cell_r33 = 0.15e-3
+    rays33 = make_input_bundle(radius=1e-3, n_rays=49, tilt_deg=1.0)
+    baseline_out = sys33.trace_bundle(rays33, 550e-9)
+    baseline_eff = power_within_radius(baseline_out, cell_r33, len(rays33))
+
+    sys33.secondary = SecondaryConcentrator(a_exit=cell_r33, theta_c_deg=8.0, reflectivity=0.95)
+    with_secondary_out = sys33.trace_bundle(rays33, 550e-9)
+    with_secondary_eff = power_within_radius(with_secondary_out, cell_r33, len(rays33))
+    assert with_secondary_eff >= baseline_eff - 1e-9, (
+        "FAIL [T33]: secondary concentrator should not reduce off-axis collection")
+    print(f"  PASS [T33 secondary concentrator: {baseline_eff:.1%} -> {with_secondary_eff:.1%} "
+          f"collection at 1 deg off-axis]")
+
+    # ── T34: trace_ray_path records the CPC bounce points and terminates
+    #         exactly at z_target when the ray is collected ────────────────
+    pts34, alive34, power34 = sys33.trace_ray_path(Ray([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]), 550e-9)
+    assert alive34, "FAIL [T34]: on-axis ray should be collected"
+    _assert_close(pts34[-1][2], sys33.z_target, tol=1e-6, label="T34 path ends at z_target")
+    assert len(pts34) > len(sys33.surfaces) + 1, (
+        "FAIL [T34]: path should include extra points from the secondary's bounces/entrance")
+    print("  PASS [T34 trace_ray_path includes secondary concentrator]")
+
+    # ── T35: optimize_lens()/auto_design() attach `secondary` to every
+    #         candidate system, not just the one make_system() builds ───────
+    sec35 = SecondaryConcentrator(a_exit=0.15e-3, theta_c_deg=8.0, reflectivity=0.95)
+    res35 = optimize_lens(
+        x0=np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3]), maxiter=5, secondary=sec35,
+        lam_list=np.array([550e-9]), rays_in=make_input_bundle(radius=1e-3, n_rays=9))
+    assert res35["system"].secondary is sec35, (
+        "FAIL [T35]: optimize_lens()'s returned system should carry the secondary")
+
+    ad35 = auto_design(
+        n_layers=2, x0=np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3]),
+        material_names=["N-BK7", "F2"], secondary=sec35,
+        full_optimize_threshold=100, final_maxiter=5,
+        lam_list=np.array([550e-9]), rays_in=make_input_bundle(radius=1e-3, n_rays=9))
+    assert ad35["best"]["system"].secondary is sec35, (
+        "FAIL [T35]: auto_design()'s winning system should carry the secondary")
+    print("  PASS [T35 optimize_lens/auto_design thread secondary through]")
 
     print("\nAll tests PASSED.\n")
 

@@ -64,10 +64,18 @@ def get_lambda_grid(values):
     )
 
 
-def get_rays_in(values):
+def get_rays_in(values, tilt_deg=0.0):
+    """
+    tilt_deg defaults to 0 (on-axis) rather than reading values["tilt_deg"]
+    automatically — the Optimize/Auto-design tabs also call this for the
+    actual search's rays_in, and that search should stay on-axis unless a
+    caller opts in explicitly, not silently chase whatever incidence angle
+    the Analysis tab's preview happens to be set to.
+    """
     return optics.make_input_bundle(
         radius=values["ray_radius_mm"] * 1e-3,
         n_rays=int(values["n_rays"]),
+        tilt_deg=tilt_deg,
     )
 
 
@@ -94,6 +102,20 @@ def _axis_id(idx, letter):
     return letter if n == 1 else f"{letter}{n}"
 
 
+def get_secondary(values):
+    """Build the sidebar's configured SecondaryConcentrator, or None if the
+    "Add secondary concentrator" checkbox is off. Shared by make_system()
+    and the Optimize/Auto-design tabs' optics.optimize_lens()/auto_design()
+    calls, so the geometry search accounts for it too."""
+    if not values.get("secondary_enabled"):
+        return None
+    return optics.SecondaryConcentrator(
+        a_exit=values["cell_radius_mm"] * 1e-3,
+        theta_c_deg=values["secondary_theta_c_deg"],
+        reflectivity=values["secondary_reflectivity"],
+    )
+
+
 def make_system(values):
     # Deliberately NOT cached: building a handful of Surface objects is
     # cheap, and st.cache_resource shares the exact same live object across
@@ -110,10 +132,12 @@ def make_system(values):
     materials = get_materials(values)
     radii = np.array(values["radii_mm"], dtype=float) * 1e-3
     thicknesses = np.array(values["thicknesses_mm"], dtype=float) * 1e-3
-    return optics.build_layered_system(
+    system = optics.build_layered_system(
         radii, thicknesses, materials, values["f_mm"] * 1e-3,
         surface_types=values["surface_types"], groove_pitches=get_groove_pitches_m(values),
     )
+    system.secondary = get_secondary(values)
+    return system
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,14 +145,18 @@ def make_system(values):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def trace_all_wavelengths(values):
+def trace_all_wavelengths(values, tilt_deg=0.0):
     """
     Trace the full ray bundle across the full wavelength grid once and cache
     the numeric results. per_wavelength_metrics / plot_rms_plotly /
     plot_spots_plotly all read from this instead of re-tracing separately.
+
+    tilt_deg is a diagnostic override (see get_rays_in()) — it previews the
+    current design at an off-axis incidence angle, independent of whatever
+    the Optimize/Auto-design tabs are actually searching against.
     """
     system = make_system(values)
-    rays_in = get_rays_in(values)
+    rays_in = get_rays_in(values, tilt_deg=tilt_deg)
     lam_grid = get_lambda_grid(values)
     cell_radius = values["cell_radius_mm"] * 1e-3
 
@@ -165,8 +193,8 @@ def trace_all_wavelengths(values):
     }
 
 
-def per_wavelength_metrics(values):
-    trace = trace_all_wavelengths(values)
+def per_wavelength_metrics(values, tilt_deg=0.0):
+    trace = trace_all_wavelengths(values, tilt_deg=tilt_deg)
     lam_grid = trace["lam_m"]
     rms_um = trace["rms_um"]
     n_rays_out = trace["n_rays_out"]
@@ -259,6 +287,14 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0):
             xs, zs = xs_arr, zs_arr
         surfaces.append((xs, zs, surf.surface_type))
 
+    if system.secondary is not None:
+        sec = system.secondary
+        z_entrance = system.z_target - sec.height
+        zs_sec = sec.z_local + z_entrance
+        xs_sec = np.concatenate([sec.rho, [np.nan], -sec.rho[::-1]])
+        zs_sec = np.concatenate([zs_sec, [np.nan], zs_sec[::-1]])
+        surfaces.append((xs_sec, zs_sec, "secondary"))
+
     return {
         "paths": paths,
         "surfaces": surfaces,
@@ -272,11 +308,12 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0):
 # Plotly figures
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_rms_plotly(series):
-    """series: list of (values_dict, label, color) tuples."""
+def plot_rms_plotly(series, tilt_deg=0.0):
+    """series: list of (values_dict, label, color) tuples, all evaluated at
+    the same diagnostic incidence angle (see get_rays_in())."""
     fig = go.Figure()
     for values, label, color in series:
-        trace = trace_all_wavelengths(values)
+        trace = trace_all_wavelengths(values, tilt_deg=tilt_deg)
         marker_colors = [_wavelength_color(lam) for lam in trace["lam_m"]]
         fig.add_trace(go.Scatter(
             x=trace["lam_m"] * 1e9,
@@ -300,8 +337,8 @@ def plot_rms_plotly(series):
     return fig
 
 
-def plot_spots_plotly(values):
-    trace = trace_all_wavelengths(values)
+def plot_spots_plotly(values, tilt_deg=0.0):
+    trace = trace_all_wavelengths(values, tilt_deg=tilt_deg)
     lam_grid = trace["lam_m"]
     rms_um = trace["rms_um"]
     spots_um = trace["spots_um"]
@@ -348,7 +385,8 @@ def plot_spots_plotly(values):
         )
 
     fig.update_layout(
-        title_text="Spot Diagrams at PV Plane (dotted circle = PV cell boundary)",
+        title_text=f"Spot Diagrams at PV Plane, {tilt_deg:+.1f}° incidence "
+                   "(dotted circle = PV cell boundary)",
         showlegend=False,
         height=280 * nrows,
         margin=dict(t=80, b=40),
@@ -366,7 +404,8 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0)
     data = compute_optical_layout(values, n_fan_rays=n_fan_rays, lam_nm=lam_nm, tilt_deg=tilt_deg)
     fig = go.Figure()
 
-    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
+    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518", "secondary": "#999999"}
+    surface_names = {"secondary": "Secondary (CPC)"}
     legend_shown = set()
     for xs, zs, surf_type in data["surfaces"]:
         is_fresnel = surf_type == "fresnel"
@@ -376,7 +415,7 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0)
             x=x_plot, y=y_plot, mode="lines",
             line=dict(color=surface_colors[surf_type], width=2),
             hoverinfo="skip",
-            name=surf_type.capitalize(),
+            name=surface_names.get(surf_type, surf_type.capitalize()),
             legendgroup=surf_type,
             showlegend=surf_type not in legend_shown,
         ))
@@ -479,6 +518,17 @@ def compute_optical_layout_3d(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
         Y = RHO * np.sin(THETA)
         surfaces.append((X, Y, Z, surf.surface_type))
 
+    if system.secondary is not None:
+        sec = system.secondary
+        z_entrance = system.z_target - sec.height
+        theta_grid = np.linspace(0.0, 2 * np.pi, mesh_theta)
+        Zl, THETA = np.meshgrid(sec.z_local, theta_grid)
+        RHO, _ = np.meshgrid(sec.rho, theta_grid)
+        X = RHO * np.cos(THETA)
+        Y = RHO * np.sin(THETA)
+        Z = Zl + z_entrance
+        surfaces.append((X, Y, Z, "secondary"))
+
     return {
         "paths": paths,
         "surfaces": surfaces,
@@ -494,14 +544,16 @@ def plot_optical_layout_3d_plotly(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
     )
     fig = go.Figure()
 
-    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
+    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518", "secondary": "#999999"}
+    surface_names = {"secondary": "Secondary (CPC)"}
     legend_shown = set()
     for X, Y, Z, surf_type in data["surfaces"]:
         color = surface_colors[surf_type]
         fig.add_trace(go.Surface(
             x=X * 1e3, y=Y * 1e3, z=Z * 1e3,
             colorscale=[[0, color], [1, color]], showscale=False, opacity=0.5,
-            name=surf_type.capitalize(), showlegend=surf_type not in legend_shown,
+            name=surface_names.get(surf_type, surf_type.capitalize()),
+            showlegend=surf_type not in legend_shown,
             hoverinfo="skip",
         ))
         legend_shown.add(surf_type)
@@ -869,18 +921,6 @@ if "_apply_params" in st.session_state:
     for _key, _val in st.session_state.pop("_apply_params").items():
         st.session_state[_key] = _val
 
-def _incidence_angle_slider(key_prefix):
-    """Reusable incidence-angle control for the optical-layout plots (2-D
-    and 3-D) — same tilt-in-the-x-z-plane convention as make_input_bundle()'s
-    tilt_deg, so it visually matches what the angular-acceptance (CAP) scan
-    measures numerically."""
-    return st.slider(
-        "Incidence angle (deg)", min_value=-10.0, max_value=10.0, value=0.0, step=0.5,
-        key=f"{key_prefix}_tilt_deg",
-        help="Tilts the ray bundle off the optical axis in the x-z plane.",
-    )
-
-
 def _render_surface_type_widget(key_prefix, label):
     """Spherical/Fresnel selector for one surface, plus a groove-pitch field
     that only appears when Fresnel is selected. Returns (type, pitch_mm)."""
@@ -966,6 +1006,16 @@ with st.sidebar:
             options=[9, 16, 25, 36, 49, 64, 81, 100],
             value=DEFAULTS["n_rays"], key="n_rays",
         )
+        tilt_deg = st.slider(
+            "Incidence angle (deg)", min_value=-10.0, max_value=10.0, value=0.0, step=0.5,
+            key="tilt_deg",
+            help="Tilts the incoming ray bundle off the optical axis in the "
+                 "x-z plane, to preview how the current design's metrics, "
+                 "spot diagrams, and layout diagrams degrade off-axis. Does "
+                 "NOT change what the Optimize/Auto-design searches target "
+                 "(they still optimize on-axis) — see the angular-acceptance "
+                 "(CAP) expander below for that tradeoff quantified properly.",
+        )
 
         st.header("PV cell")
         cell_radius_mm = st.number_input(
@@ -975,6 +1025,36 @@ with st.sidebar:
                  "angular-acceptance / concentration-acceptance-product (CAP) "
                  "analysis, distinct from the lens aperture above.",
         )
+        secondary_enabled = st.checkbox(
+            "Add secondary concentrator (CPC) at the cell", value=False,
+            key="secondary_enabled",
+            help="Mounts an ideal compound parabolic concentrator (a small "
+                 "mirrored funnel) directly on the PV cell to widen angular "
+                 "acceptance — the standard fix for a primary lens whose high "
+                 "concentration otherwise gives it a razor-thin acceptance "
+                 "angle. Applied everywhere: Analysis metrics/diagrams, and "
+                 "the Optimize/Auto-design geometry search (which then "
+                 "optimizes the lens knowing this concentrator is in place).",
+        )
+        if secondary_enabled:
+            secondary_theta_c_deg = st.number_input(
+                "Secondary acceptance half-angle (deg)", min_value=0.5, max_value=60.0,
+                value=8.0, step=0.5, format="%.1f", key="secondary_theta_c_deg",
+                help="Design half-angle of the CPC — any ray within this "
+                     "angle of the axis reaches the cell after at most a "
+                     "couple of wall bounces. Smaller angle = more added "
+                     "concentration but a taller, narrower funnel.",
+            )
+            secondary_reflectivity = st.slider(
+                "Mirror reflectivity", min_value=0.5, max_value=1.0, value=0.90, step=0.01,
+                key="secondary_reflectivity",
+                help="Per-bounce power reflectance of the funnel's mirror wall "
+                     "(~0.85-0.95 for a good specular coating; 1.0 = ideal "
+                     "lossless mirror).",
+            )
+        else:
+            secondary_theta_c_deg = 8.0
+            secondary_reflectivity = 0.90
 
         st.header("Spectrum")
         lam_start_nm = st.number_input(
@@ -1014,7 +1094,11 @@ values = {
     "f_mm": f_mm,
     "ray_radius_mm": ray_radius_mm,
     "cell_radius_mm": cell_radius_mm,
+    "secondary_enabled": secondary_enabled,
+    "secondary_theta_c_deg": secondary_theta_c_deg,
+    "secondary_reflectivity": secondary_reflectivity,
     "n_rays": n_rays,
+    "tilt_deg": tilt_deg,
     "lam_start_nm": lam_start_nm,
     "lam_end_nm": lam_end_nm,
     "lam_steps": lam_steps,
@@ -1033,7 +1117,7 @@ if values["n_layers"] == 2 and values["materials"][0] == values["materials"][1]:
     )
 
 system = make_system(values)
-metrics_df, current_cost = per_wavelength_metrics(values)
+metrics_df, current_cost = per_wavelength_metrics(values, tilt_deg=values["tilt_deg"])
 materials = get_materials(values)
 
 tab_analysis, tab_3d, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
@@ -1065,9 +1149,8 @@ with tab_analysis:
     )
 
     st.subheader("Optical layout")
-    tilt_analysis = _incidence_angle_slider("layout_analysis")
     st.plotly_chart(
-        plot_optical_layout_plotly(values, tilt_deg=tilt_analysis),
+        plot_optical_layout_plotly(values, tilt_deg=values["tilt_deg"]),
         use_container_width=True, key="layout_analysis",
     )
 
@@ -1075,7 +1158,7 @@ with tab_analysis:
 
     with left:
         st.plotly_chart(
-            plot_rms_plotly([(values, "Current design", RMS_COLOR)]),
+            plot_rms_plotly([(values, "Current design", RMS_COLOR)], tilt_deg=values["tilt_deg"]),
             use_container_width=True,
             key="rms_analysis",
         )
@@ -1098,7 +1181,10 @@ with tab_analysis:
         )
 
     st.subheader("Spot diagrams")
-    st.plotly_chart(plot_spots_plotly(values), use_container_width=True, key="spots_analysis")
+    st.plotly_chart(
+        plot_spots_plotly(values, tilt_deg=values["tilt_deg"]),
+        use_container_width=True, key="spots_analysis",
+    )
 
     with st.expander("Chromatic focus shift"):
         if st.button("Calculate focus shift", type="secondary"):
@@ -1119,7 +1205,7 @@ with tab_3d:
         "the full 3-D path — valid since every surface here is centered on "
         "the axis. Drag to rotate, scroll to zoom."
     )
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     n_radii_3d = c1.slider("Radial rings", min_value=1, max_value=8, value=4, key="viz3d_n_radii")
     n_azimuth_3d = c2.slider("Azimuthal rays per ring", min_value=4, max_value=24, value=12, key="viz3d_n_azimuth")
     lam_nm_3d = c3.number_input(
@@ -1127,11 +1213,10 @@ with tab_3d:
         value=float(np.clip(550.0, values["lam_start_nm"], values["lam_end_nm"])),
         step=10.0, key="viz3d_lam_nm",
     )
-    with c4:
-        tilt_3d = _incidence_angle_slider("viz3d")
     st.plotly_chart(
         plot_optical_layout_3d_plotly(
-            values, n_radii=n_radii_3d, n_azimuth=n_azimuth_3d, lam_nm=lam_nm_3d, tilt_deg=tilt_3d,
+            values, n_radii=n_radii_3d, n_azimuth=n_azimuth_3d, lam_nm=lam_nm_3d,
+            tilt_deg=values["tilt_deg"],
         ),
         use_container_width=True, key="layout_3d",
     )
@@ -1209,6 +1294,7 @@ with tab_optimize:
                 surface_types=values["surface_types"],
                 groove_pitches=get_groove_pitches_m(values),
                 optimize_groove_pitch=optimize_pitch,
+                secondary=get_secondary(values),
                 progress_callback=_report_progress,
             )
 
@@ -1285,20 +1371,22 @@ with tab_optimize:
             plot_rms_plotly([
                 (base_values, "Initial", INITIAL_COLOR),
                 (opt_values, "Optimized", OPTIMIZED_COLOR),
-            ]),
+            ], tilt_deg=opt_values["tilt_deg"]),
             use_container_width=True,
             key="rms_optimize",
         )
 
         st.subheader("Optimized optical layout")
-        tilt_optimize = _incidence_angle_slider("layout_optimize")
         st.plotly_chart(
-            plot_optical_layout_plotly(opt_values, tilt_deg=tilt_optimize),
+            plot_optical_layout_plotly(opt_values, tilt_deg=opt_values["tilt_deg"]),
             use_container_width=True, key="layout_optimize",
         )
 
         st.subheader("Optimized spot diagrams")
-        st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
+        st.plotly_chart(
+            plot_spots_plotly(opt_values, tilt_deg=opt_values["tilt_deg"]),
+            use_container_width=True, key="spots_optimize",
+        )
 
         render_acceptance_expander(opt_values, "optimize")
         render_uniformity_expander(opt_values, "optimize")
@@ -1390,6 +1478,7 @@ with tab_auto:
                 groove_pitches=get_groove_pitches_m(values),
                 optimize_groove_pitch=optimize_pitch,
                 search_surface_types=search_surface_types,
+                secondary=get_secondary(values),
                 full_optimize_threshold=int(full_optimize_threshold),
                 screen_maxiter=int(screen_maxiter),
                 halving_rounds=int(halving_rounds),
@@ -1521,20 +1610,23 @@ with tab_auto:
         )
 
         st.subheader("Best design — optical layout")
-        tilt_auto = _incidence_angle_slider("layout_auto")
         st.plotly_chart(
-            plot_optical_layout_plotly(best_values, tilt_deg=tilt_auto),
+            plot_optical_layout_plotly(best_values, tilt_deg=best_values["tilt_deg"]),
             use_container_width=True, key="layout_auto",
         )
 
         st.subheader("Best design — RMS vs wavelength")
         st.plotly_chart(
-            plot_rms_plotly([(best_values, "Best design", OPTIMIZED_COLOR)]),
+            plot_rms_plotly([(best_values, "Best design", OPTIMIZED_COLOR)],
+                            tilt_deg=best_values["tilt_deg"]),
             use_container_width=True, key="rms_auto",
         )
 
         st.subheader("Best design — spot diagrams")
-        st.plotly_chart(plot_spots_plotly(best_values), use_container_width=True, key="spots_auto")
+        st.plotly_chart(
+            plot_spots_plotly(best_values, tilt_deg=best_values["tilt_deg"]),
+            use_container_width=True, key="spots_auto",
+        )
 
         render_acceptance_expander(best_values, "auto")
         render_uniformity_expander(best_values, "auto")
