@@ -797,7 +797,8 @@ def make_input_bundle(radius: float = 1e-3, n_rays: int = 25, tilt_deg: float = 
     return rays
 
 
-def make_ray_fan(radius: float = 1e-3, n_rays: int = 9, y: float = 0.0) -> list:
+def make_ray_fan(radius: float = 1e-3, n_rays: int = 9, y: float = 0.0,
+                  tilt_deg: float = 0.0) -> list:
     """
     Create a 1-D fan of paraxial rays spread along x at a fixed y (default
     the y=0 meridional plane), for optical-layout / ray-fan diagrams —
@@ -806,20 +807,24 @@ def make_ray_fan(radius: float = 1e-3, n_rays: int = 9, y: float = 0.0) -> list:
 
     Parameters
     ----------
-    radius : aperture half-width [m]
-    n_rays : number of rays in the fan
-    y      : fixed y-coordinate [m] for every ray (0.0 = meridional plane)
+    radius   : aperture half-width [m]
+    n_rays   : number of rays in the fan
+    y        : fixed y-coordinate [m] for every ray (0.0 = meridional plane)
+    tilt_deg : incidence angle [deg] off the optical axis, tilted in the x-z
+               plane — same convention as make_input_bundle()'s tilt_deg.
 
     Returns
     -------
     list[Ray]
     """
     xs = np.linspace(-radius, radius, max(int(n_rays), 2))
-    return [Ray(origin=[x, y, 0.0], direction=[0.0, 0.0, 1.0]) for x in xs]
+    theta = np.radians(tilt_deg)
+    direction = [np.sin(theta), 0.0, np.cos(theta)]
+    return [Ray(origin=[x, y, 0.0], direction=direction) for x in xs]
 
 
 def make_ray_starburst(radius: float = 1e-3, n_radii: int = 4, n_azimuth: int = 10,
-                        include_center: bool = True) -> list:
+                        include_center: bool = True, tilt_deg: float = 0.0) -> list:
     """
     Create a 3-D bundle of paraxial rays spread across several radii and
     azimuthal angles over a circular aperture — for the 3-D optical-layout
@@ -832,20 +837,24 @@ def make_ray_starburst(radius: float = 1e-3, n_radii: int = 4, n_azimuth: int = 
                      (exclusive of 0 — the center ray is added separately)
     n_azimuth      : number of azimuthal samples per ring
     include_center : also include a single on-axis ray
+    tilt_deg       : incidence angle [deg] off the optical axis, tilted in
+                     the x-z plane — same convention as make_input_bundle().
 
     Returns
     -------
     list[Ray]
     """
+    theta_tilt = np.radians(tilt_deg)
+    direction = [np.sin(theta_tilt), 0.0, np.cos(theta_tilt)]
     rays = []
     if include_center:
-        rays.append(Ray(origin=[0.0, 0.0, 0.0], direction=[0.0, 0.0, 1.0]))
+        rays.append(Ray(origin=[0.0, 0.0, 0.0], direction=direction))
     radii = np.linspace(radius / n_radii, radius, max(int(n_radii), 1))
     thetas = np.linspace(0.0, 2 * np.pi, max(int(n_azimuth), 1), endpoint=False)
     for rho in radii:
         for theta in thetas:
             origin = [rho * np.cos(theta), rho * np.sin(theta), 0.0]
-            rays.append(Ray(origin=origin, direction=[0.0, 0.0, 1.0]))
+            rays.append(Ray(origin=origin, direction=direction))
     return rays
 
 

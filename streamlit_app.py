@@ -230,7 +230,7 @@ def _fresnel_zone_profile(R, cx, cz, aperture_half, pitch):
 
 
 @st.cache_data(show_spinner=False)
-def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
+def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0):
     """
     Geometry (surface profile points) + a small ray fan traced through the
     full path (not just the final PV-plane point), for the optical-layout
@@ -239,7 +239,7 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
     system = make_system(values)
     aperture = values["ray_radius_mm"] * 1e-3
 
-    fan = optics.make_ray_fan(radius=aperture, n_rays=n_fan_rays)
+    fan = optics.make_ray_fan(radius=aperture, n_rays=n_fan_rays, tilt_deg=tilt_deg)
     paths = []
     for ray in fan:
         pts, alive, power = system.trace_ray_path(ray, lam_nm * 1e-9)
@@ -362,8 +362,8 @@ def _scale_with_gaps(seq, factor):
     return [v * factor if v is not None else None for v in seq]
 
 
-def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
-    data = compute_optical_layout(values, n_fan_rays=n_fan_rays, lam_nm=lam_nm)
+def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0, tilt_deg=0.0):
+    data = compute_optical_layout(values, n_fan_rays=n_fan_rays, lam_nm=lam_nm, tilt_deg=tilt_deg)
     fig = go.Figure()
 
     surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
@@ -414,7 +414,7 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
     ))
 
     fig.update_layout(
-        title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm "
+        title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm, {tilt_deg:+.1f}° incidence "
               "(dotted = lost ray, fainter = more Fresnel loss)",
         xaxis_title="z (mm)",
         yaxis_title="x — radial distance from optical axis (mm)",
@@ -446,7 +446,7 @@ def _fresnel_z_of_rho(R, cz, rho, aperture_half, pitch):
 
 @st.cache_data(show_spinner=False)
 def compute_optical_layout_3d(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
-                               mesh_rho=24, mesh_theta=48):
+                               mesh_rho=24, mesh_theta=48, tilt_deg=0.0):
     """
     3-D counterpart of compute_optical_layout(): a starburst ray bundle
     traced through the full path, plus each surface revolved around the
@@ -456,7 +456,8 @@ def compute_optical_layout_3d(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
     system = make_system(values)
     aperture = values["ray_radius_mm"] * 1e-3
 
-    bundle = optics.make_ray_starburst(radius=aperture, n_radii=n_radii, n_azimuth=n_azimuth)
+    bundle = optics.make_ray_starburst(radius=aperture, n_radii=n_radii, n_azimuth=n_azimuth,
+                                        tilt_deg=tilt_deg)
     paths = []
     for ray in bundle:
         pts, alive, power = system.trace_ray_path(ray, lam_nm * 1e-9)
@@ -487,8 +488,10 @@ def compute_optical_layout_3d(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
     }
 
 
-def plot_optical_layout_3d_plotly(values, n_radii=4, n_azimuth=12, lam_nm=550.0):
-    data = compute_optical_layout_3d(values, n_radii=n_radii, n_azimuth=n_azimuth, lam_nm=lam_nm)
+def plot_optical_layout_3d_plotly(values, n_radii=4, n_azimuth=12, lam_nm=550.0, tilt_deg=0.0):
+    data = compute_optical_layout_3d(
+        values, n_radii=n_radii, n_azimuth=n_azimuth, lam_nm=lam_nm, tilt_deg=tilt_deg,
+    )
     fig = go.Figure()
 
     surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
@@ -531,10 +534,14 @@ def plot_optical_layout_3d_plotly(values, n_radii=4, n_azimuth=12, lam_nm=550.0)
     ))
 
     fig.update_layout(
-        title=f"3-D Optical Layout — ray bundle @ {lam_nm:.0f} nm "
+        title=f"3-D Optical Layout — ray bundle @ {lam_nm:.0f} nm, {tilt_deg:+.1f}° incidence "
               "(dotted = lost ray, fainter = more Fresnel loss)",
         scene=dict(
-            xaxis_title="x (mm)", yaxis_title="y (mm)", zaxis_title="z — optical axis (mm)",
+            xaxis_title="x (mm)", yaxis_title="y (mm)",
+            # z increases from the lens (z=0) toward the PV plane
+            # (z_target > 0); reversing the axis puts the lens on top and
+            # the PV plane on the bottom, matching the physical stack-up.
+            zaxis=dict(title="z — optical axis (mm)", autorange="reversed"),
             aspectmode="cube",
         ),
         margin=dict(t=60, b=40),
@@ -862,6 +869,18 @@ if "_apply_params" in st.session_state:
     for _key, _val in st.session_state.pop("_apply_params").items():
         st.session_state[_key] = _val
 
+def _incidence_angle_slider(key_prefix):
+    """Reusable incidence-angle control for the optical-layout plots (2-D
+    and 3-D) — same tilt-in-the-x-z-plane convention as make_input_bundle()'s
+    tilt_deg, so it visually matches what the angular-acceptance (CAP) scan
+    measures numerically."""
+    return st.slider(
+        "Incidence angle (deg)", min_value=-10.0, max_value=10.0, value=0.0, step=0.5,
+        key=f"{key_prefix}_tilt_deg",
+        help="Tilts the ray bundle off the optical axis in the x-z plane.",
+    )
+
+
 def _render_surface_type_widget(key_prefix, label):
     """Spherical/Fresnel selector for one surface, plus a groove-pitch field
     that only appears when Fresnel is selected. Returns (type, pitch_mm)."""
@@ -1046,7 +1065,11 @@ with tab_analysis:
     )
 
     st.subheader("Optical layout")
-    st.plotly_chart(plot_optical_layout_plotly(values), use_container_width=True, key="layout_analysis")
+    tilt_analysis = _incidence_angle_slider("layout_analysis")
+    st.plotly_chart(
+        plot_optical_layout_plotly(values, tilt_deg=tilt_analysis),
+        use_container_width=True, key="layout_analysis",
+    )
 
     left, right = st.columns([1.1, 1])
 
@@ -1096,7 +1119,7 @@ with tab_3d:
         "the full 3-D path — valid since every surface here is centered on "
         "the axis. Drag to rotate, scroll to zoom."
     )
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     n_radii_3d = c1.slider("Radial rings", min_value=1, max_value=8, value=4, key="viz3d_n_radii")
     n_azimuth_3d = c2.slider("Azimuthal rays per ring", min_value=4, max_value=24, value=12, key="viz3d_n_azimuth")
     lam_nm_3d = c3.number_input(
@@ -1104,8 +1127,12 @@ with tab_3d:
         value=float(np.clip(550.0, values["lam_start_nm"], values["lam_end_nm"])),
         step=10.0, key="viz3d_lam_nm",
     )
+    with c4:
+        tilt_3d = _incidence_angle_slider("viz3d")
     st.plotly_chart(
-        plot_optical_layout_3d_plotly(values, n_radii=n_radii_3d, n_azimuth=n_azimuth_3d, lam_nm=lam_nm_3d),
+        plot_optical_layout_3d_plotly(
+            values, n_radii=n_radii_3d, n_azimuth=n_azimuth_3d, lam_nm=lam_nm_3d, tilt_deg=tilt_3d,
+        ),
         use_container_width=True, key="layout_3d",
     )
 
@@ -1264,7 +1291,11 @@ with tab_optimize:
         )
 
         st.subheader("Optimized optical layout")
-        st.plotly_chart(plot_optical_layout_plotly(opt_values), use_container_width=True, key="layout_optimize")
+        tilt_optimize = _incidence_angle_slider("layout_optimize")
+        st.plotly_chart(
+            plot_optical_layout_plotly(opt_values, tilt_deg=tilt_optimize),
+            use_container_width=True, key="layout_optimize",
+        )
 
         st.subheader("Optimized spot diagrams")
         st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
@@ -1490,7 +1521,11 @@ with tab_auto:
         )
 
         st.subheader("Best design — optical layout")
-        st.plotly_chart(plot_optical_layout_plotly(best_values), use_container_width=True, key="layout_auto")
+        tilt_auto = _incidence_angle_slider("layout_auto")
+        st.plotly_chart(
+            plot_optical_layout_plotly(best_values, tilt_deg=tilt_auto),
+            use_container_width=True, key="layout_auto",
+        )
 
         st.subheader("Best design — RMS vs wavelength")
         st.plotly_chart(
