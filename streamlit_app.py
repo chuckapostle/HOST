@@ -407,8 +407,8 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
     fig.add_trace(go.Scatter(
         x=[z_target_mm, z_target_mm], y=[-cell_radius_mm, cell_radius_mm],
         mode="lines+markers",
-        line=dict(color="black", width=5),
-        marker=dict(size=10, symbol="line-ew", line=dict(width=2, color="black")),
+        line=dict(color="white", width=5),
+        marker=dict(size=10, symbol="line-ew", line=dict(width=2, color="white")),
         name="PV cell width",
         hovertemplate=f"PV cell: ±{cell_radius_mm:.3f} mm<extra>PV cell width</extra>",
     ))
@@ -419,6 +419,126 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
         xaxis_title="z (mm)",
         yaxis_title="x — radial distance from optical axis (mm)",
         margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def _spherical_z_of_rho(R, cz, rho):
+    sign = 1.0 if R >= 0 else -1.0
+    return cz - sign * np.sqrt(np.maximum(R ** 2 - rho ** 2, 0.0))
+
+
+def _fresnel_z_of_rho(R, cz, rho, aperture_half, pitch):
+    """Vectorized radial counterpart of _fresnel_zone_profile()'s per-zone
+    linear approximation — evaluates the same schematic sawtooth at
+    arbitrary radii instead of only at zone boundaries, so it can be
+    revolved into a surface mesh."""
+    z0 = cz - R
+    sign = 1.0 if R >= 0 else -1.0
+    rho = np.clip(rho, 0.0, aperture_half)
+    k = np.floor(rho / pitch)
+    rho_start = k * pitch
+    rho_ref = np.minimum((k + 0.5) * pitch, aperture_half)
+    inside = np.maximum(R * R - rho_ref ** 2, 1e-12)
+    slope = sign * rho_ref / np.sqrt(inside)
+    return z0 + slope * (rho - rho_start)
+
+
+@st.cache_data(show_spinner=False)
+def compute_optical_layout_3d(values, n_radii=4, n_azimuth=12, lam_nm=550.0,
+                               mesh_rho=24, mesh_theta=48):
+    """
+    3-D counterpart of compute_optical_layout(): a starburst ray bundle
+    traced through the full path, plus each surface revolved around the
+    optical axis into a mesh — valid because every surface here is built
+    on-axis (center x = y = 0), see build_layered_system().
+    """
+    system = make_system(values)
+    aperture = values["ray_radius_mm"] * 1e-3
+
+    bundle = optics.make_ray_starburst(radius=aperture, n_radii=n_radii, n_azimuth=n_azimuth)
+    paths = []
+    for ray in bundle:
+        pts, alive, power = system.trace_ray_path(ray, lam_nm * 1e-9)
+        paths.append((np.array(pts), alive, power))
+
+    surfaces = []
+    for surf in system.surfaces:
+        R = surf.R
+        cz = surf.center[2]
+        half_ap = min(aperture * 1.3, abs(R) * 0.97) if R != 0 else aperture * 1.3
+        rho_grid = np.linspace(0.0, half_ap, mesh_rho)
+        theta_grid = np.linspace(0.0, 2 * np.pi, mesh_theta)
+        RHO, THETA = np.meshgrid(rho_grid, theta_grid)
+        if surf.surface_type == "fresnel":
+            Z = _fresnel_z_of_rho(R, cz, RHO, half_ap, surf.groove_pitch)
+        else:
+            Z = _spherical_z_of_rho(R, cz, RHO)
+        X = RHO * np.cos(THETA)
+        Y = RHO * np.sin(THETA)
+        surfaces.append((X, Y, Z, surf.surface_type))
+
+    return {
+        "paths": paths,
+        "surfaces": surfaces,
+        "z_target": system.z_target,
+        "aperture": aperture,
+        "cell_radius": values["cell_radius_mm"] * 1e-3,
+    }
+
+
+def plot_optical_layout_3d_plotly(values, n_radii=4, n_azimuth=12, lam_nm=550.0):
+    data = compute_optical_layout_3d(values, n_radii=n_radii, n_azimuth=n_azimuth, lam_nm=lam_nm)
+    fig = go.Figure()
+
+    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
+    legend_shown = set()
+    for X, Y, Z, surf_type in data["surfaces"]:
+        color = surface_colors[surf_type]
+        fig.add_trace(go.Surface(
+            x=X * 1e3, y=Y * 1e3, z=Z * 1e3,
+            colorscale=[[0, color], [1, color]], showscale=False, opacity=0.5,
+            name=surf_type.capitalize(), showlegend=surf_type not in legend_shown,
+            hoverinfo="skip",
+        ))
+        legend_shown.add(surf_type)
+
+    n_paths = len(data["paths"])
+    for i, (pts, alive, power) in enumerate(data["paths"]):
+        if pts.shape[0] < 2:
+            continue
+        frac = i / max(n_paths - 1, 1)
+        color = f"rgb({int(255 * frac)},80,{int(255 * (1 - frac))})"
+        fig.add_trace(go.Scatter3d(
+            x=pts[:, 0] * 1e3, y=pts[:, 1] * 1e3, z=pts[:, 2] * 1e3,
+            mode="lines",
+            line=dict(color=color, width=3, dash="solid" if alive else "dot"),
+            opacity=max(0.2, power),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    theta_full = np.linspace(0.0, 2 * np.pi, 100)
+    cell_radius_mm = data["cell_radius"] * 1e3
+    z_target_mm = data["z_target"] * 1e3
+    fig.add_trace(go.Scatter3d(
+        x=cell_radius_mm * np.cos(theta_full),
+        y=cell_radius_mm * np.sin(theta_full),
+        z=np.full_like(theta_full, z_target_mm),
+        mode="lines",
+        line=dict(color="white", width=5),
+        name="PV cell boundary",
+        hovertemplate=f"PV cell radius: {cell_radius_mm:.3f} mm<extra>PV cell boundary</extra>",
+    ))
+
+    fig.update_layout(
+        title=f"3-D Optical Layout — ray bundle @ {lam_nm:.0f} nm "
+              "(dotted = lost ray, fainter = more Fresnel loss)",
+        scene=dict(
+            xaxis_title="x (mm)", yaxis_title="y (mm)", zaxis_title="z — optical axis (mm)",
+            aspectmode="cube",
+        ),
+        margin=dict(t=60, b=40),
+        height=700,
     )
     return fig
 
@@ -897,8 +1017,8 @@ system = make_system(values)
 metrics_df, current_cost = per_wavelength_metrics(values)
 materials = get_materials(values)
 
-tab_analysis, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
-    ["Analysis", "Material survey", "Optimize", "Auto-design", "Export"]
+tab_analysis, tab_3d, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
+    ["Analysis", "3-D view", "Material survey", "Optimize", "Auto-design", "Export"]
 )
 
 with tab_analysis:
@@ -968,6 +1088,26 @@ with tab_analysis:
     render_acceptance_expander(values, "analysis")
     render_uniformity_expander(values, "analysis")
     render_tolerancing_expander(values, "analysis")
+
+with tab_3d:
+    st.caption(
+        "Revolves the lens surfaces around the optical axis and traces a "
+        "starburst ray bundle (several radii × azimuthal angles) through "
+        "the full 3-D path — valid since every surface here is centered on "
+        "the axis. Drag to rotate, scroll to zoom."
+    )
+    c1, c2, c3 = st.columns(3)
+    n_radii_3d = c1.slider("Radial rings", min_value=1, max_value=8, value=4, key="viz3d_n_radii")
+    n_azimuth_3d = c2.slider("Azimuthal rays per ring", min_value=4, max_value=24, value=12, key="viz3d_n_azimuth")
+    lam_nm_3d = c3.number_input(
+        "Wavelength (nm)", min_value=values["lam_start_nm"], max_value=values["lam_end_nm"],
+        value=float(np.clip(550.0, values["lam_start_nm"], values["lam_end_nm"])),
+        step=10.0, key="viz3d_lam_nm",
+    )
+    st.plotly_chart(
+        plot_optical_layout_3d_plotly(values, n_radii=n_radii_3d, n_azimuth=n_azimuth_3d, lam_nm=lam_nm_3d),
+        use_container_width=True, key="layout_3d",
+    )
 
 with tab_survey:
     if values["n_layers"] != 2:

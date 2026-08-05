@@ -818,6 +818,37 @@ def make_ray_fan(radius: float = 1e-3, n_rays: int = 9, y: float = 0.0) -> list:
     return [Ray(origin=[x, y, 0.0], direction=[0.0, 0.0, 1.0]) for x in xs]
 
 
+def make_ray_starburst(radius: float = 1e-3, n_radii: int = 4, n_azimuth: int = 10,
+                        include_center: bool = True) -> list:
+    """
+    Create a 3-D bundle of paraxial rays spread across several radii and
+    azimuthal angles over a circular aperture — for the 3-D optical-layout
+    diagram, as opposed to make_ray_fan()'s single meridional (y=0) fan.
+
+    Parameters
+    ----------
+    radius         : aperture half-width [m]
+    n_radii        : number of radial rings sampled between 0 and radius
+                     (exclusive of 0 — the center ray is added separately)
+    n_azimuth      : number of azimuthal samples per ring
+    include_center : also include a single on-axis ray
+
+    Returns
+    -------
+    list[Ray]
+    """
+    rays = []
+    if include_center:
+        rays.append(Ray(origin=[0.0, 0.0, 0.0], direction=[0.0, 0.0, 1.0]))
+    radii = np.linspace(radius / n_radii, radius, max(int(n_radii), 1))
+    thetas = np.linspace(0.0, 2 * np.pi, max(int(n_azimuth), 1), endpoint=False)
+    for rho in radii:
+        for theta in thetas:
+            origin = [rho * np.cos(theta), rho * np.sin(theta), 0.0]
+            rays.append(Ray(origin=origin, direction=[0.0, 0.0, 1.0]))
+    return rays
+
+
 def rms_spot_radius(rays) -> float:
     """
     RMS radial spot size on the detector plane.
