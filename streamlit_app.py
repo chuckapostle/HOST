@@ -130,16 +130,24 @@ def trace_all_wavelengths(values):
     system = make_system(values)
     rays_in = get_rays_in(values)
     lam_grid = get_lambda_grid(values)
+    cell_radius = values["cell_radius_mm"] * 1e-3
 
     rms_um = np.full(len(lam_grid), np.nan)
     n_rays_out = np.zeros(len(lam_grid), dtype=int)
     efficiency = np.zeros(len(lam_grid))
+    collection_efficiency = np.zeros(len(lam_grid))
     spots_um = []
 
     for i, lam in enumerate(lam_grid):
         rays_out = system.trace_bundle(rays_in, lam)
         n_rays_out[i] = len(rays_out)
+        # "Optical efficiency" only asks whether a ray reached the target
+        # plane at all (Fresnel losses aside); it says nothing about WHERE
+        # it landed. A spot bigger than the actual cell can look great on
+        # that number while mostly missing the cell — "collection
+        # efficiency" is the number that actually answers that.
         efficiency[i] = optics.optical_efficiency(rays_out, len(rays_in))
+        collection_efficiency[i] = optics.power_within_radius(rays_out, cell_radius, len(rays_in))
         if rays_out:
             pts = np.array([r.o for r in rays_out])[:, :2] * 1e6
             rms_um[i] = optics.rms_spot_radius(rays_out) * 1e6
@@ -152,6 +160,7 @@ def trace_all_wavelengths(values):
         "rms_um": rms_um,
         "n_rays_out": n_rays_out,
         "efficiency": efficiency,
+        "collection_efficiency": collection_efficiency,
         "spots_um": spots_um,
     }
 
@@ -162,11 +171,14 @@ def per_wavelength_metrics(values):
     rms_um = trace["rms_um"]
     n_rays_out = trace["n_rays_out"]
     efficiency = trace["efficiency"]
+    collection_efficiency = trace["collection_efficiency"]
 
     rows = []
     weighted_cost = 0.0
 
-    for lam, rms, n_out, eff in zip(lam_grid, rms_um, n_rays_out, efficiency):
+    for lam, rms, n_out, eff, coll_eff in zip(
+        lam_grid, rms_um, n_rays_out, efficiency, collection_efficiency
+    ):
         weight = optics.pv_weight(lam)
         if np.isfinite(rms):
             weighted_cost += weight * (rms * 1e-6) ** 2
@@ -176,6 +188,7 @@ def per_wavelength_metrics(values):
                 "PV weight": weight,
                 "RMS spot radius (µm)": rms,
                 "Optical efficiency": eff,
+                "Collection efficiency (on cell)": coll_eff,
                 "Rays reaching PV": int(n_out),
             }
         )
@@ -246,7 +259,13 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
             xs, zs = xs_arr, zs_arr
         surfaces.append((xs, zs, surf.surface_type))
 
-    return {"paths": paths, "surfaces": surfaces, "z_target": system.z_target}
+    return {
+        "paths": paths,
+        "surfaces": surfaces,
+        "z_target": system.z_target,
+        "aperture": aperture,
+        "cell_radius": values["cell_radius_mm"] * 1e-3,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,6 +305,7 @@ def plot_spots_plotly(values):
     lam_grid = trace["lam_m"]
     rms_um = trace["rms_um"]
     spots_um = trace["spots_um"]
+    cell_radius_um = values["cell_radius_mm"] * 1e3
 
     n_lam = len(lam_grid)
     ncols = min(5, n_lam)
@@ -312,6 +332,14 @@ def plot_spots_plotly(values):
                 ),
                 row=row, col=col,
             )
+        # PV cell boundary, so it's visually obvious whether the spot fits
+        # inside the actual cell or spills outside it.
+        fig.add_shape(
+            type="circle",
+            x0=-cell_radius_um, y0=-cell_radius_um, x1=cell_radius_um, y1=cell_radius_um,
+            line=dict(color="black", dash="dot", width=1.5),
+            row=row, col=col,
+        )
         fig.update_xaxes(title_text="x (µm)", zeroline=True, row=row, col=col)
         fig.update_yaxes(
             title_text="y (µm)", zeroline=True,
@@ -320,7 +348,7 @@ def plot_spots_plotly(values):
         )
 
     fig.update_layout(
-        title_text="Spot Diagrams at PV Plane",
+        title_text="Spot Diagrams at PV Plane (dotted circle = PV cell boundary)",
         showlegend=False,
         height=280 * nrows,
         margin=dict(t=80, b=40),
@@ -369,11 +397,27 @@ def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
         x=data["z_target"] * 1e3, line=dict(color="red", dash="dot", width=1.5),
         annotation_text="PV plane", annotation_position="top",
     )
+
+    # The lens surface curves already show the full aperture width (at z=0,
+    # y spans +/- ray_radius_mm) — this adds the actual PV cell width at the
+    # target plane as a distinct marker, so aperture / converging spot /
+    # cell are all visible on the same axes at once.
+    z_target_mm = data["z_target"] * 1e3
+    cell_radius_mm = data["cell_radius"] * 1e3
+    fig.add_trace(go.Scatter(
+        x=[z_target_mm, z_target_mm], y=[-cell_radius_mm, cell_radius_mm],
+        mode="lines+markers",
+        line=dict(color="black", width=5),
+        marker=dict(size=10, symbol="line-ew", line=dict(width=2, color="black")),
+        name="PV cell width",
+        hovertemplate=f"PV cell: ±{cell_radius_mm:.3f} mm<extra>PV cell width</extra>",
+    ))
+
     fig.update_layout(
         title=f"Optical Layout — ray fan @ {lam_nm:.0f} nm "
               "(dotted = lost ray, fainter = more Fresnel loss)",
         xaxis_title="z (mm)",
-        yaxis_title="x (mm)",
+        yaxis_title="x — radial distance from optical axis (mm)",
         margin=dict(t=60, b=40),
     )
     return fig
@@ -485,6 +529,174 @@ def render_acceptance_expander(values, key_prefix):
             )
             c3.metric("CAP", f"{scan['CAP']:.3f}" if scan["CAP"] is not None else "—")
             st.plotly_chart(plot_acceptance_plotly(scan), use_container_width=True, key=f"{key_prefix}_accept_fig")
+
+
+@st.cache_data(show_spinner=False)
+def compute_uniformity_scan(values, n_bins=6):
+    system = make_system(values)
+    rays_in = get_rays_in(values)
+    lam_grid = get_lambda_grid(values)
+    cell_radius = values["cell_radius_mm"] * 1e-3
+
+    peak_to_avg = np.full(len(lam_grid), np.nan)
+    cv = np.full(len(lam_grid), np.nan)
+    for i, lam in enumerate(lam_grid):
+        rays_out = system.trace_bundle(rays_in, lam)
+        u = optics.irradiance_uniformity(rays_out, cell_radius, n_bins=n_bins)
+        if u["peak_to_avg"] is not None:
+            peak_to_avg[i] = u["peak_to_avg"]
+            cv[i] = u["cv"]
+    return {"lam_m": lam_grid, "peak_to_avg": peak_to_avg, "cv": cv}
+
+
+def plot_uniformity_plotly(scan):
+    lam_nm = scan["lam_m"] * 1e9
+    colors = [_wavelength_color(lam) for lam in scan["lam_m"]]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Peak-to-average irradiance", "Coefficient of variation"),
+    )
+    fig.add_trace(go.Scatter(
+        x=lam_nm, y=scan["peak_to_avg"], mode="lines+markers",
+        marker=dict(color=colors, size=9),
+        line=dict(color="rgba(120,120,120,0.5)"),
+        hovertemplate="%{x:.0f} nm<br>peak/avg = %{y:.2f}×<extra></extra>",
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=lam_nm, y=scan["cv"], mode="lines+markers",
+        marker=dict(color=colors, size=9),
+        line=dict(color="rgba(120,120,120,0.5)"),
+        hovertemplate="%{x:.0f} nm<br>CV = %{y:.2f}<extra></extra>",
+        showlegend=False,
+    ), row=1, col=2)
+    fig.add_hline(y=1.0, line=dict(color="green", dash="dot"), row=1, col=1,
+                  annotation_text="perfectly uniform")
+    fig.add_hline(y=0.0, line=dict(color="green", dash="dot"), row=1, col=2,
+                  annotation_text="perfectly uniform")
+
+    fig.update_xaxes(title_text="Wavelength (nm)")
+    fig.update_yaxes(title_text="Peak / average irradiance", row=1, col=1)
+    fig.update_yaxes(title_text="Coefficient of variation", row=1, col=2)
+    fig.update_layout(title_text="Irradiance Uniformity on PV Cell", height=420, margin=dict(t=80, b=40))
+    return fig
+
+
+def render_uniformity_expander(values, key_prefix):
+    """
+    Reusable "Irradiance uniformity" expander — same pattern as
+    render_acceptance_expander(), see its docstring.
+    """
+    with st.expander("Irradiance uniformity"):
+        st.caption(
+            "RMS spot radius alone doesn't say whether the cell is evenly lit "
+            "or has a bright hotspot with a dim rim — multi-junction cells are "
+            "sensitive to that (non-uniform illumination causes current "
+            "mismatch between sub-cells). Radially binned within the PV cell "
+            "radius; peak/average = 1.0 and CV = 0.0 both mean perfectly even. "
+            "With few rays, bins can be noisy — increase the sidebar's ray "
+            "count for a more reliable estimate."
+        )
+        if st.button("Calculate uniformity", type="secondary", key=f"{key_prefix}_unif_btn"):
+            with st.spinner("Binning irradiance across the spectrum..."):
+                scan = compute_uniformity_scan(values)
+            finite = np.isfinite(scan["peak_to_avg"])
+            c1, c2 = st.columns(2)
+            c1.metric(
+                "Mean peak/average",
+                f"{np.nanmean(scan['peak_to_avg']):.2f}×" if finite.any() else "—",
+            )
+            c2.metric(
+                "Mean CV",
+                f"{np.nanmean(scan['cv']):.2f}" if finite.any() else "—",
+            )
+            st.plotly_chart(plot_uniformity_plotly(scan), use_container_width=True, key=f"{key_prefix}_unif_fig")
+
+
+@st.cache_data(show_spinner=False)
+def compute_tolerance_sensitivity(values, delta_mm=0.01):
+    materials = get_materials(values)
+    surface_types = values["surface_types"]
+    groove_pitches = get_groove_pitches_m(values)
+
+    def builder(p):
+        return optics.build_nlayer_system(
+            p, materials, surface_types=surface_types, groove_pitches=groove_pitches)
+
+    return optics.tolerance_sensitivity(
+        make_params(values), builder,
+        lam_list=get_lambda_grid(values),
+        rays_in=get_rays_in(values),
+        param_names=optics.default_param_names(values["n_layers"]),
+        delta=delta_mm * 1e-3,
+    )
+
+
+def plot_tolerance_plotly(sensitivity, delta_mm):
+    order = sorted(range(len(sensitivity)),
+                   key=lambda i: sensitivity[i]["rms_sensitivity_um_per_mm"])
+    names = [sensitivity[i]["parameter"] for i in order]
+    vals = [sensitivity[i]["rms_sensitivity_um_per_mm"] for i in order]
+
+    fig = go.Figure(go.Bar(x=vals, y=names, orientation="h", marker=dict(color=RMS_COLOR)))
+    fig.update_layout(
+        title=f"RMS Spot Sensitivity per Parameter (±{delta_mm:g} mm perturbation)",
+        xaxis_title="Δ RMS spot radius (µm) per mm of parameter error",
+        yaxis_title="Parameter",
+        margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def render_tolerancing_expander(values, key_prefix):
+    """
+    Reusable "Tolerancing" expander — same pattern as
+    render_acceptance_expander(), see its docstring.
+    """
+    with st.expander("Tolerancing (sensitivity analysis)"):
+        st.caption(
+            "One-at-a-time sensitivity: perturbs each geometry parameter by "
+            "±delta (holding everything else fixed) and reports how much RMS "
+            "spot size moves — a design that's optically best but collapses "
+            "with a tiny manufacturing error isn't actually the best design "
+            "to build. Higher sensitivity means that dimension needs tighter "
+            "control. This doesn't cover decenter/tilt or simultaneous "
+            "multi-parameter error, only one-at-a-time axis-aligned error."
+        )
+        delta_mm = st.number_input(
+            "Perturbation size (mm)", min_value=0.001, value=0.01, step=0.005,
+            format="%.4f", key=f"{key_prefix}_tol_delta",
+        )
+        if st.button("Run sensitivity analysis", type="secondary", key=f"{key_prefix}_tol_btn"):
+            with st.spinner("Perturbing each parameter..."):
+                sensitivity = compute_tolerance_sensitivity(values, delta_mm=delta_mm)
+
+            df = pd.DataFrame([
+                {
+                    "Parameter": e["parameter"],
+                    "Nominal (mm)": e["nominal"] * 1e3,
+                    f"RMS @ -{delta_mm:g}mm (µm)": e["rms_minus_um"],
+                    "RMS nominal (µm)": e["rms_nominal_um"],
+                    f"RMS @ +{delta_mm:g}mm (µm)": e["rms_plus_um"],
+                    "Sensitivity (µm/mm)": e["rms_sensitivity_um_per_mm"],
+                }
+                for e in sensitivity
+            ]).sort_values("Sensitivity (µm/mm)", ascending=False)
+            st.dataframe(
+                df.style.format({
+                    "Nominal (mm)": "{:+.4f}",
+                    f"RMS @ -{delta_mm:g}mm (µm)": "{:.3f}",
+                    "RMS nominal (µm)": "{:.3f}",
+                    f"RMS @ +{delta_mm:g}mm (µm)": "{:.3f}",
+                    "Sensitivity (µm/mm)": "{:.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+            st.plotly_chart(
+                plot_tolerance_plotly(sensitivity, delta_mm),
+                use_container_width=True, key=f"{key_prefix}_tol_fig",
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,17 +902,27 @@ tab_analysis, tab_survey, tab_optimize, tab_auto, tab_export = st.tabs(
 )
 
 with tab_analysis:
-    cols = st.columns(len(materials) + 3)
+    cols = st.columns(len(materials) + 4)
     for i, mat in enumerate(materials):
         cols[i].metric(f"Layer {i + 1}", mat.name)
-    cols[-3].metric("Weighted cost", f"{current_cost:.3e}")
-    cols[-2].metric(
+    cols[-4].metric("Weighted cost", f"{current_cost:.3e}")
+    cols[-3].metric(
         "Mean RMS spot radius",
         f"{metrics_df['RMS spot radius (µm)'].mean():.2f} µm",
     )
-    cols[-1].metric(
+    cols[-2].metric(
         "Mean optical efficiency",
         f"{metrics_df['Optical efficiency'].mean():.1%}",
+        help="Fraction of incident power that reaches the target plane "
+             "somewhere (Fresnel losses only) — doesn't check whether it "
+             "actually landed on the cell. See collection efficiency for that.",
+    )
+    cols[-1].metric(
+        "Mean collection efficiency",
+        f"{metrics_df['Collection efficiency (on cell)'].mean():.1%}",
+        help="Fraction of incident power landing within the sidebar's PV "
+             "cell radius — the number that actually answers 'how much of "
+             "the collected light lands on the cell'.",
     )
 
     st.subheader("Optical layout")
@@ -724,6 +946,7 @@ with tab_analysis:
                     "PV weight": "{:.1f}",
                     "RMS spot radius (µm)": "{:.3f}",
                     "Optical efficiency": "{:.1%}",
+                    "Collection efficiency (on cell)": "{:.1%}",
                     "Rays reaching PV": "{:.0f}",
                 }
             ).map(_wavelength_cell_style, subset=["Wavelength (nm)"]),
@@ -743,6 +966,8 @@ with tab_analysis:
             st.plotly_chart(fig_focus, use_container_width=True, key="focus_shift_analysis")
 
     render_acceptance_expander(values, "analysis")
+    render_uniformity_expander(values, "analysis")
+    render_tolerancing_expander(values, "analysis")
 
 with tab_survey:
     if values["n_layers"] != 2:
@@ -789,6 +1014,11 @@ with tab_optimize:
         "for the honest cost; a coarser subsample of both is used internally "
         "during the search for speed."
     )
+    optimize_pitch = st.checkbox(
+        "Optimize groove pitch for any Fresnel surface", value=True, key="opt_pitch_toggle",
+        help="Search each Fresnel surface's groove pitch alongside geometry "
+             "instead of holding it fixed at the sidebar's value.",
+    )
 
     if st.button("Optimize lens", type="primary"):
         progress_bar = st.progress(0, text="Optimizing... iteration 0")
@@ -811,6 +1041,7 @@ with tab_optimize:
                 rays_in=get_rays_in(values),
                 surface_types=values["surface_types"],
                 groove_pitches=get_groove_pitches_m(values),
+                optimize_groove_pitch=optimize_pitch,
                 progress_callback=_report_progress,
             )
 
@@ -829,6 +1060,7 @@ with tab_optimize:
             "thicknesses_mm": (params[n_layers_r + 1:2 * n_layers_r + 1] * 1e3).tolist(),
             "f_mm": float(params[2 * n_layers_r + 1] * 1e3),
             "materials": list(values["materials"]),
+            "groove_pitches_mm": [p * 1e3 if p is not None else None for p in result["groove_pitches"]],
             "cost": result["cost"],
             "base_values": dict(values),
         }
@@ -847,13 +1079,17 @@ with tab_optimize:
         opt_values["thicknesses_mm"] = thicknesses_mm_r
         opt_values["f_mm"] = f_mm_r
         opt_values["materials"] = opt_state["materials"]
-        opt_efficiency = trace_all_wavelengths(opt_values)["efficiency"].mean()
+        opt_values["groove_pitches_mm"] = opt_state["groove_pitches_mm"]
+        opt_trace = trace_all_wavelengths(opt_values)
+        opt_efficiency = opt_trace["efficiency"].mean()
+        opt_collection = opt_trace["collection_efficiency"].mean()
 
-        cols = st.columns(len(opt_state["materials"]) + 2)
+        cols = st.columns(len(opt_state["materials"]) + 3)
         for i, mname in enumerate(opt_state["materials"]):
             cols[i].metric(f"Layer {i + 1}", mname)
-        cols[-2].metric("Final cost", f"{opt_state['cost']:.4e}")
-        cols[-1].metric("Mean optical efficiency", f"{opt_efficiency:.1%}")
+        cols[-3].metric("Final cost", f"{opt_state['cost']:.4e}")
+        cols[-2].metric("Mean optical efficiency", f"{opt_efficiency:.1%}")
+        cols[-1].metric("Mean collection efficiency", f"{opt_collection:.1%}")
 
         param_rows = (
             [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
@@ -872,6 +1108,9 @@ with tab_optimize:
                 pending[f"R{i}_mm"] = float(r)
             for i, t in enumerate(thicknesses_mm_r):
                 pending[f"t{i + 1}_mm"] = float(t)
+            for i, p in enumerate(opt_state["groove_pitches_mm"]):
+                if p is not None:
+                    pending[f"R{i}_pitch"] = float(p)
             st.session_state["_apply_params"] = pending
             st.rerun()
 
@@ -891,6 +1130,8 @@ with tab_optimize:
         st.plotly_chart(plot_spots_plotly(opt_values), use_container_width=True, key="spots_optimize")
 
         render_acceptance_expander(opt_values, "optimize")
+        render_uniformity_expander(opt_values, "optimize")
+        render_tolerancing_expander(opt_values, "optimize")
 
 with tab_auto:
     st.write(
@@ -904,8 +1145,7 @@ with tab_auto:
         "final-resolution iteration budget below."
     )
 
-    all_combos = optics.generate_material_combinations(values["n_layers"])
-    n_combos = len(all_combos)
+    n_material_combos = len(optics.generate_material_combinations(values["n_layers"]))
 
     with st.expander("Advanced search settings"):
         full_optimize_threshold = st.number_input(
@@ -925,10 +1165,38 @@ with tab_auto:
             "Finalists given a full-resolution pass", min_value=1, value=3, step=1,
             key="auto_top_k",
         )
+        optimize_pitch = st.checkbox(
+            "Optimize groove pitch for any Fresnel surface", value=True, key="auto_pitch_toggle",
+            help="Search each Fresnel surface's groove pitch alongside geometry "
+                 "instead of holding it fixed at the sidebar's value.",
+        )
+        search_surface_types = st.checkbox(
+            "Search surface types too (spherical vs. Fresnel per surface)",
+            value=False, key="auto_search_surf_types",
+            help=f"Also tries every spherical/Fresnel assignment across all "
+                 f"{values['n_layers'] + 1} surfaces (2^{values['n_layers'] + 1} = "
+                 f"{2 ** (values['n_layers'] + 1)} of them), crossed with the "
+                 "material search — a large multiplier on top of it, so this "
+                 "run will take proportionally longer. Off by default; when "
+                 "off, every combination uses the sidebar's current per-surface "
+                 "spherical/Fresnel choice.",
+        )
+        max_workers = st.number_input(
+            "Parallel workers", min_value=1, max_value=16, value=1, step=1,
+            key="auto_max_workers",
+            help="Combinations within a round run concurrently on this many "
+                 "threads. Benchmarking found this workload is dominated by "
+                 "per-call Python overhead rather than large numpy array "
+                 "work, so threads consistently measured ~15-20% *slower* "
+                 "than sequential here — defaults to 1 for that reason. Only "
+                 "raise it if you've verified it actually helps for your "
+                 "own settings (ray count, iteration budget, etc.).",
+        )
 
+    n_combos = n_material_combos * (2 ** (values["n_layers"] + 1) if search_surface_types else 1)
     will_halve = n_combos > full_optimize_threshold
     st.caption(
-        f"{n_combos} candidate material combination(s) for {values['n_layers']} "
+        f"{n_combos} candidate combination(s) for {values['n_layers']} "
         f"layer(s) — " + ("will use successive halving." if will_halve
                            else "will fully optimize every combination.")
     )
@@ -949,11 +1217,14 @@ with tab_auto:
                 method=values["opt_method"],
                 surface_types=values["surface_types"],
                 groove_pitches=get_groove_pitches_m(values),
+                optimize_groove_pitch=optimize_pitch,
+                search_surface_types=search_surface_types,
                 full_optimize_threshold=int(full_optimize_threshold),
                 screen_maxiter=int(screen_maxiter),
                 halving_rounds=int(halving_rounds),
                 top_k_final=int(top_k_final),
                 final_maxiter=int(values["opt_maxiter"]),
+                max_workers=int(max_workers),
                 progress_callback=_report_auto_progress,
             )
 
@@ -961,6 +1232,7 @@ with tab_auto:
 
         n_layers_r = values["n_layers"]
         best_params = ad_result["best"]["params"]
+        best_pitches = ad_result["best"]["groove_pitches"]
         # Persisted in session_state so the results section below survives the
         # rerun triggered by the "apply to sidebar" button (see the Optimize
         # tab above for the same pattern and why it's needed).
@@ -970,6 +1242,9 @@ with tab_auto:
             "thicknesses_mm": (best_params[n_layers_r + 1:2 * n_layers_r + 1] * 1e3).tolist(),
             "f_mm": float(best_params[2 * n_layers_r + 1] * 1e3),
             "materials": ad_result["best_materials"],
+            "surface_types": ad_result["best_surface_types"],
+            "groove_pitches_mm": [p * 1e3 if p is not None else None for p in best_pitches],
+            "search_surface_types": search_surface_types,
             "cost": ad_result["best"]["cost"],
             "leaderboard": ad_result["leaderboard"],
             "n_combinations_total": ad_result["n_combinations_total"],
@@ -986,9 +1261,25 @@ with tab_auto:
         thicknesses_mm_r = auto_state["thicknesses_mm"]
         f_mm_r = auto_state["f_mm"]
 
+        base_values = auto_state["base_values"]
+        best_values = dict(base_values)
+        best_values["n_layers"] = n_layers_r
+        best_values["radii_mm"] = radii_mm_r
+        best_values["thicknesses_mm"] = thicknesses_mm_r
+        best_values["f_mm"] = f_mm_r
+        best_values["materials"] = auto_state["materials"]
+        # The winner's own surface types/pitches — NOT necessarily the same
+        # as the current sidebar, since search_surface_types may have picked
+        # a different spherical/Fresnel assignment than what's shown there.
+        best_values["surface_types"] = auto_state["surface_types"]
+        best_values["groove_pitches_mm"] = auto_state["groove_pitches_mm"]
+        best_collection = trace_all_wavelengths(best_values)["collection_efficiency"].mean()
+
+        surf_summary = "/".join(t[0].upper() for t in auto_state["surface_types"])
         st.success(
-            f"Best design: {' / '.join(auto_state['materials'])} — searched "
-            f"{auto_state['n_combinations_evaluated']} of "
+            f"Best design: {' / '.join(auto_state['materials'])}"
+            + (f" — surfaces [{surf_summary}]" if auto_state["search_surface_types"] else "")
+            + f" — searched {auto_state['n_combinations_evaluated']} of "
             f"{auto_state['n_combinations_total']} combination(s)"
             + (" via successive halving." if auto_state["used_halving"] else " (fully optimized).")
         )
@@ -998,19 +1289,31 @@ with tab_auto:
         # be reused directly instead of re-tracing.
         best_efficiency = auto_state["leaderboard"][0]["efficiency"]
 
-        cols = st.columns(len(auto_state["materials"]) + 2)
+        cols = st.columns(len(auto_state["materials"]) + 3)
         for i, mname in enumerate(auto_state["materials"]):
             cols[i].metric(f"Layer {i + 1}", mname)
-        cols[-2].metric("Best cost", f"{auto_state['cost']:.4e}")
-        cols[-1].metric("Optical efficiency", f"{best_efficiency:.1%}")
+        cols[-3].metric("Best cost", f"{auto_state['cost']:.4e}")
+        cols[-2].metric("Optical efficiency", f"{best_efficiency:.1%}")
+        cols[-1].metric("Collection efficiency", f"{best_collection:.1%}")
 
         param_rows = (
-            [{"Parameter": f"R{i}", "Value (mm)": r} for i, r in enumerate(radii_mm_r)]
-            + [{"Parameter": f"t{i + 1}", "Value (mm)": t} for i, t in enumerate(thicknesses_mm_r)]
-            + [{"Parameter": "f", "Value (mm)": f_mm_r}]
+            [
+                {
+                    "Parameter": f"R{i}",
+                    "Value (mm)": r,
+                    "Type": auto_state["surface_types"][i],
+                    "Pitch (mm)": auto_state["groove_pitches_mm"][i],
+                }
+                for i, r in enumerate(radii_mm_r)
+            ]
+            + [{"Parameter": f"t{i + 1}", "Value (mm)": t, "Type": "", "Pitch (mm)": None}
+               for i, t in enumerate(thicknesses_mm_r)]
+            + [{"Parameter": "f", "Value (mm)": f_mm_r, "Type": "", "Pitch (mm)": None}]
         )
         st.dataframe(
-            pd.DataFrame(param_rows).style.format({"Value (mm)": "{:+.4f}"}),
+            pd.DataFrame(param_rows).style.format(
+                {"Value (mm)": "{:+.4f}", "Pitch (mm)": "{:.4f}"}, na_rep=""
+            ),
             use_container_width=True,
             hide_index=True,
         )
@@ -1019,6 +1322,9 @@ with tab_auto:
             pending = {"n_layers": n_layers_r, "f_mm": f_mm_r}
             for i, r in enumerate(radii_mm_r):
                 pending[f"R{i}_mm"] = float(r)
+                pending[f"R{i}_type"] = auto_state["surface_types"][i].capitalize()
+                if auto_state["groove_pitches_mm"][i] is not None:
+                    pending[f"R{i}_pitch"] = float(auto_state["groove_pitches_mm"][i])
             for i, t in enumerate(thicknesses_mm_r):
                 pending[f"t{i + 1}_mm"] = float(t)
             for i, mname in enumerate(auto_state["materials"]):
@@ -1027,27 +1333,21 @@ with tab_auto:
             st.rerun()
 
         st.subheader("Leaderboard")
-        leaderboard_df = pd.DataFrame([
-            {
-                "Materials": " / ".join(entry["materials"]),
-                "Cost": entry["cost"],
-                "Optical efficiency": entry["efficiency"],
-            }
-            for entry in auto_state["leaderboard"]
-        ])
+        leaderboard_rows = []
+        for entry in auto_state["leaderboard"]:
+            row = {"Materials": " / ".join(entry["materials"])}
+            if auto_state["search_surface_types"]:
+                row["Surfaces"] = "/".join(t[0].upper() for t in entry["surface_types"])
+            row["Cost"] = entry["cost"]
+            row["Optical efficiency"] = entry["efficiency"]
+            leaderboard_rows.append(row)
         st.dataframe(
-            leaderboard_df.style.format({"Cost": "{:.4e}", "Optical efficiency": "{:.1%}"}),
+            pd.DataFrame(leaderboard_rows).style.format(
+                {"Cost": "{:.4e}", "Optical efficiency": "{:.1%}"}
+            ),
             use_container_width=True,
             hide_index=True,
         )
-
-        base_values = auto_state["base_values"]
-        best_values = dict(base_values)
-        best_values["n_layers"] = n_layers_r
-        best_values["radii_mm"] = radii_mm_r
-        best_values["thicknesses_mm"] = thicknesses_mm_r
-        best_values["f_mm"] = f_mm_r
-        best_values["materials"] = auto_state["materials"]
 
         st.subheader("Best design — optical layout")
         st.plotly_chart(plot_optical_layout_plotly(best_values), use_container_width=True, key="layout_auto")
@@ -1062,6 +1362,8 @@ with tab_auto:
         st.plotly_chart(plot_spots_plotly(best_values), use_container_width=True, key="spots_auto")
 
         render_acceptance_expander(best_values, "auto")
+        render_uniformity_expander(best_values, "auto")
+        render_tolerancing_expander(best_values, "auto")
 
         with st.expander("Console output"):
             st.code(auto_state["console"][-5000:], language="text")

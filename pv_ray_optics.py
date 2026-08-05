@@ -22,6 +22,7 @@ Structure
 import csv
 import argparse
 import itertools
+import concurrent.futures
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -877,6 +878,60 @@ def power_within_radius(rays_out, radius: float, n_rays_in: int) -> float:
     return total / n_rays_in
 
 
+def irradiance_uniformity(rays_out, cell_radius: float, n_bins: int = 6) -> dict:
+    """
+    Radially-binned irradiance uniformity across a PV cell — RMS spot
+    radius alone doesn't say whether a cell is evenly lit or has a bright
+    hotspot with a dim rim, and multi-junction cells are sensitive to that
+    (non-uniform illumination causes current mismatch between sub-cells).
+    Bins are annuli (not a 2D grid) so the metric stays meaningful with the
+    modest ray counts this tracer normally uses, at the cost of only
+    capturing radial (not azimuthal) non-uniformity.
+
+    Parameters
+    ----------
+    rays_out    : list[Ray] – system.trace_bundle() output
+    cell_radius : float [m] – PV cell radius the bins span
+    n_bins      : number of equal-width radial bins
+
+    Returns
+    -------
+    dict with keys:
+        'bin_edges'   : (n_bins+1,) radii [m]
+        'irradiance'  : (n_bins,) power per unit area in each annulus
+                        (arbitrary units: ray "power" per m²)
+        'peak_to_avg' : max/mean irradiance (1.0 = perfectly uniform), or
+                        None if no power landed within the cell
+        'cv'          : coefficient of variation, std/mean (0.0 = perfectly
+                        uniform), or None under the same condition
+    """
+    bin_edges = np.linspace(0.0, cell_radius, n_bins + 1)
+    powers = np.zeros(n_bins)
+
+    for r in (rays_out or []):
+        rho = np.hypot(r.o[0], r.o[1])
+        if rho > cell_radius:
+            continue
+        idx = min(int(np.searchsorted(bin_edges, rho, side="right") - 1), n_bins - 1)
+        idx = max(idx, 0)
+        powers[idx] += r.power
+
+    areas = np.pi * (bin_edges[1:] ** 2 - bin_edges[:-1] ** 2)
+    irradiance = np.divide(powers, areas, out=np.zeros_like(powers), where=areas > 0)
+
+    mean_irr = irradiance.mean()
+    if mean_irr < 1e-15:
+        return {"bin_edges": bin_edges, "irradiance": irradiance,
+                "peak_to_avg": None, "cv": None}
+
+    return {
+        "bin_edges": bin_edges,
+        "irradiance": irradiance,
+        "peak_to_avg": float(irradiance.max() / mean_irr),
+        "cv": float(irradiance.std() / mean_irr),
+    }
+
+
 def pv_weight(lam: float) -> float:
     """
     Spectral weight: 2× for the peak Si PV response band (500–900 nm),
@@ -1053,6 +1108,8 @@ def concentration_acceptance_product(system: LayeredLensSystem,
 #   f                   : target focal length / PV-plane z-position [m]
 
 MIN_LAYER_THICKNESS = 0.5e-3  # guard: keep layer thicknesses positive and sensible
+MIN_GROOVE_PITCH = 0.01e-3    # guard: keep an optimizer-searched groove pitch positive and sensible
+DEFAULT_GROOVE_PITCH = 0.2e-3  # starting guess when optimizing pitch with no prior value to warm-start from
 
 
 def build_layered_system(radii, thicknesses, materials, f,
@@ -1168,6 +1225,7 @@ def optimize_lens(materials=None,
                   rays_in=None,
                   surface_types=None,
                   groove_pitches=None,
+                  optimize_groove_pitch: bool = True,
                   progress_callback=None) -> dict:
     """
     Minimise concentration_cost for an N-layer lens stack.
@@ -1179,9 +1237,14 @@ def optimize_lens(materials=None,
     mat1, mat2        : materials for the two layers — legacy 2-layer
                          interface, kept for backward compatibility. Ignored
                          if `materials` is given.
-    x0                : initial params [R0..Rn, t1..tn, f] (metres);
-                         required whenever the layer count isn't 2 (the
-                         2-layer case falls back to the historical default).
+    x0                : initial params [R0..Rn, t1..tn, f] (metres), or that
+                         plus one groove pitch per Fresnel surface appended
+                         in surface-index order (see optimize_groove_pitch)
+                         — either is accepted, the pitch part is filled in
+                         from `groove_pitches`/DEFAULT_GROOVE_PITCH if
+                         omitted. Required whenever the layer count isn't 2
+                         (the 2-layer case falls back to the historical
+                         default).
     method            : scipy.optimize method
     maxiter           : maximum optimiser iterations
     lam_list          : wavelength grid [m] used for the honest init/final
@@ -1193,17 +1256,30 @@ def optimize_lens(materials=None,
                          straight through to build_layered_system() — a
                          fixed choice, not something this optimizer searches
                          over (surface type is categorical, not a continuum
-                         Nelder-Mead/Powell can move through). Defaults to
+                         Nelder-Mead/Powell can move through — see
+                         auto_design()'s search_surface_types for searching
+                         *across* categorical choices instead). Defaults to
                          all-spherical.
-    groove_pitches    : per-surface groove pitch [m], required wherever
-                         surface_types says "fresnel"
+    groove_pitches    : per-surface groove pitch [m]. Used as the starting
+                         guess for Fresnel surfaces when optimize_groove_pitch
+                         is True (required wherever surface_types says
+                         "fresnel" if it's False, i.e. held fixed).
+    optimize_groove_pitch : whenever a surface is Fresnel, search its groove
+                         pitch alongside the geometry instead of holding it
+                         fixed at `groove_pitches` — pitch is continuous, so
+                         it fits the same Nelder-Mead/Powell search as the
+                         radii/thicknesses (unlike surface_type itself).
+                         Default True.
     progress_callback : optional callable(iteration:int, maxiter:int),
                          invoked after every scipy.optimize iteration —
                          lets a caller (e.g. a UI) drive a progress bar.
 
     Returns
     -------
-    dict with keys 'params', 'cost', 'result', 'system', 'materials'
+    dict with keys 'params' (geometry only, always [R0..Rn, t1..tn, f] —
+    the pitch part, if any, is split out), 'cost', 'result', 'system',
+    'materials', 'groove_pitches' (per-surface, None where not Fresnel;
+    reflects the optimized value when optimize_groove_pitch was used)
     (plus, for backward compatibility, 'mat1'/'mat2' when there are
     exactly 2 layers).
     """
@@ -1215,6 +1291,13 @@ def optimize_lens(materials=None,
         materials = [mat1, mat2]
 
     n_layers = len(materials)
+    n_surfaces = n_layers + 1
+    base_len = 2 * n_layers + 2
+
+    fresnel_idx = []
+    if surface_types is not None:
+        fresnel_idx = [i for i in range(n_surfaces) if surface_types[i] == "fresnel"]
+    search_pitch = optimize_groove_pitch and len(fresnel_idx) > 0
 
     if x0 is None:
         if n_layers == 2:
@@ -1222,15 +1305,35 @@ def optimize_lens(materials=None,
         else:
             raise ValueError(
                 "x0 must be provided explicitly when len(materials) != 2.")
+    x0 = np.asarray(x0, dtype=float)
+
+    if search_pitch and len(x0) == base_len:
+        # Append a starting pitch guess per Fresnel surface, in index order.
+        pitch_x0 = [
+            groove_pitches[i] if (groove_pitches and groove_pitches[i]) else DEFAULT_GROOVE_PITCH
+            for i in fresnel_idx
+        ]
+        x0 = np.concatenate([x0, pitch_x0])
+    elif not search_pitch and len(x0) != base_len:
+        x0 = x0[:base_len]  # tolerate a caller passing an extended x0 back in unchanged
 
     if lam_list is None:
         lam_list = LAMBDA_GRID
     if rays_in is None:
         rays_in = make_input_bundle()
 
+    def _unpack(p):
+        """Split an optimizer params vector into (geometry, groove_pitches)."""
+        pitches = list(groove_pitches) if groove_pitches else [None] * n_surfaces
+        if search_pitch:
+            for idx, val in zip(fresnel_idx, p[base_len:]):
+                pitches[idx] = max(float(val), MIN_GROOVE_PITCH)
+        return p[:base_len], pitches
+
     def builder(p):
-        return build_nlayer_system(p, materials, surface_types=surface_types,
-                                   groove_pitches=groove_pitches)
+        geom, pitches = _unpack(p)
+        return build_nlayer_system(geom, materials, surface_types=surface_types,
+                                   groove_pitches=pitches)
 
     # ── Fast coarse cost (fewer rays + coarser λ grid) used during search ──
     # Subsampled from the caller's own grid/bundle, capped at ~7 wavelengths
@@ -1286,13 +1389,16 @@ def optimize_lens(materials=None,
     print(f"  Iterations   : {_state['nit']}  (converged={result.success})")
     print(f"  Final cost   : {final_cost:.6e}")
 
-    system = builder(result.x)
+    final_geom, final_pitches = _unpack(result.x)
+    system = build_nlayer_system(final_geom, materials, surface_types=surface_types,
+                                 groove_pitches=final_pitches)
     out = {
-        "params":    result.x,
-        "cost":      final_cost,
-        "result":    result,
-        "system":    system,
-        "materials": materials,
+        "params":         final_geom,
+        "cost":           final_cost,
+        "result":         result,
+        "system":         system,
+        "materials":      materials,
+        "groove_pitches": final_pitches,
     }
     if n_layers == 2:
         # Legacy keys, kept for callers written against the 2-layer API.
@@ -1338,6 +1444,15 @@ def generate_material_combinations(n_layers: int, material_names=None):
     return combos
 
 
+def generate_surface_type_combinations(n_layers: int):
+    """
+    All 2^(n_layers+1) spherical/fresnel assignments across every surface —
+    unlike materials, there's no "adjacent duplicate is optically inert"
+    rule for surface type, so this is the plain cartesian product.
+    """
+    return list(itertools.product(("spherical", "fresnel"), repeat=n_layers + 1))
+
+
 def _halving_round_counts(n_combos, halving_rounds, top_k_final):
     """Number of combinations optimized in each successive-halving round."""
     counts = []
@@ -1362,6 +1477,9 @@ def auto_design(n_layers: int,
                 final_maxiter: int = 500,
                 surface_types=None,
                 groove_pitches=None,
+                optimize_groove_pitch: bool = True,
+                search_surface_types: bool = False,
+                max_workers=1,
                 progress_callback=None) -> dict:
     """
     Jointly search material combinations and geometry for the best N-layer
@@ -1386,12 +1504,54 @@ def auto_design(n_layers: int,
                                optimize_lens() run at the end
     final_maxiter           : iteration budget for the full-optimize path and
                                the final pass of the halving path
-    surface_types           : per-surface "spherical"/"fresnel" list, fixed
-                               for every combination searched (see
-                               optimize_lens() — this isn't part of the
-                               search space, only geometry and materials are)
-    groove_pitches          : per-surface groove pitch [m], as above
-    progress_callback       : optional callable(step:int, total:int, label:str)
+    surface_types           : per-surface "spherical"/"fresnel" list — the
+                               fixed choice used for every combination when
+                               search_surface_types is False (default
+                               all-spherical); ignored when it's True.
+    groove_pitches          : per-surface starting groove pitch [m], used
+                               (and, by default, then optimized further —
+                               see optimize_groove_pitch) wherever a surface
+                               ends up Fresnel
+    optimize_groove_pitch   : passed straight through to optimize_lens() for
+                               every combination — search each Fresnel
+                               surface's pitch alongside geometry rather than
+                               holding it fixed at `groove_pitches`. Default
+                               True.
+    search_surface_types    : also search every spherical/fresnel assignment
+                               across all N+1 surfaces (2^(N+1) of them),
+                               crossed with the material combinations,
+                               instead of fixing surface_types. This is a
+                               large multiplier on top of the material
+                               search (e.g. a 3-surface design: x8; a
+                               5-surface one: x32) — the halving path handles
+                               the extra combinations fine, but a run will
+                               take proportionally longer. Default False.
+    max_workers             : combinations within a single round (or the
+                               whole full-optimize pass) are independent of
+                               each other, so *can* run concurrently via a
+                               thread pool with this many workers — but
+                               benchmarking (25-400 rays, 50-500 iterations)
+                               consistently showed threads ~15-20% *slower*
+                               than sequential, not faster: this workload is
+                               dominated by per-call Python overhead (the
+                               Nelder-Mead driver loop, Ray object
+                               construction) rather than large numpy array
+                               ops, so there's little GIL-releasing work to
+                               overlap and thread scheduling is pure
+                               overhead. Defaults to 1 (sequential) because
+                               of that; raise it only if you've verified it
+                               actually helps for your own workload profile.
+                               True process-based parallelism would likely
+                               help here, but multiprocessing's pickling
+                               requirements and platform differences (this
+                               function's inner closures aren't picklable
+                               as-is) make it a bigger, riskier change than
+                               this codebase's deployment target warrants
+                               right now.
+    progress_callback       : optional callable(step:int, total:int, label:str),
+                               invoked from the main thread as each
+                               combination finishes (completion order, not
+                               input order, since work runs concurrently)
 
     Returns
     -------
@@ -1399,13 +1559,22 @@ def auto_design(n_layers: int,
         'best'                     : optimize_lens()-style result dict for
                                       the winning combination
         'best_materials'           : list of material names for the winner
-        'leaderboard'              : list of {'materials','cost','params',
+        'best_surface_types'       : list of surface types for the winner
+        'leaderboard'              : list of {'materials','surface_types',
+                                      'cost','params','groove_pitches',
                                       'efficiency'} dicts, best first
         'n_combinations_total'     : number of combinations considered
         'n_combinations_evaluated' : number of optimize_lens() calls made
         'used_halving'             : whether the halving path was taken
     """
-    combos = generate_material_combinations(n_layers, material_names)
+    material_combos = generate_material_combinations(n_layers, material_names)
+    if search_surface_types:
+        surface_combos = generate_surface_type_combinations(n_layers)
+    else:
+        fixed_surf = tuple(surface_types) if surface_types else tuple(["spherical"] * (n_layers + 1))
+        surface_combos = [fixed_surf]
+    combos = [(mat, surf) for mat in material_combos for surf in surface_combos]
+
     n_combos = len(combos)
     if n_combos == 0:
         raise ValueError("No valid material combinations for this layer count.")
@@ -1415,25 +1584,54 @@ def auto_design(n_layers: int,
     if rays_in is None:
         rays_in = make_input_bundle()
 
-    def _optimize_combo(combo, x_start, maxiter):
-        materials = [CANDIDATE_MATERIALS[name] for name in combo]
+    def _combo_label(combo):
+        mat_names, surf_types = combo
+        label = "/".join(mat_names)
+        if search_surface_types:
+            label += " [" + "".join(t[0].upper() for t in surf_types) + "]"
+        return label
+
+    def _optimize_combo(combo, x_start, pitch_start, maxiter):
+        mat_names, surf_types = combo
+        materials = [CANDIDATE_MATERIALS[name] for name in mat_names]
         return optimize_lens(materials=materials, x0=x_start, method=method,
                              maxiter=maxiter, lam_list=lam_list, rays_in=rays_in,
-                             surface_types=surface_types, groove_pitches=groove_pitches)
+                             surface_types=list(surf_types), groove_pitches=pitch_start,
+                             optimize_groove_pitch=optimize_groove_pitch)
 
-    step = 0
+    step_counter = {"n": 0}
+
+    def _run_batch(work_items, total, label_fn):
+        """
+        work_items: list of (combo, x_start, pitch_start, budget). Runs
+        _optimize_combo for each concurrently; returns {combo: optimize_lens()
+        result}. progress_callback is only ever invoked here, from the main
+        thread, as each future completes — never from inside a worker thread.
+        """
+        out = {}
+        workers = max(1, min(max_workers, len(work_items)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_combo = {
+                executor.submit(_optimize_combo, combo, x_start, pitch_start, budget): combo
+                for combo, x_start, pitch_start, budget in work_items
+            }
+            for future in concurrent.futures.as_completed(future_to_combo):
+                combo = future_to_combo[future]
+                out[combo] = future.result()
+                step_counter["n"] += 1
+                if progress_callback is not None:
+                    progress_callback(step_counter["n"], total, label_fn(combo))
+        return out
+
     used_halving = n_combos > full_optimize_threshold
 
     if not used_halving:
         total = n_combos
-        results = []
-        for combo in combos:
-            res = _optimize_combo(combo, x0, final_maxiter)
-            results.append((combo, res))
-            step += 1
-            if progress_callback is not None:
-                progress_callback(step, total, "/".join(combo))
-        results.sort(key=lambda cr: cr[1]["cost"])
+        result_map = _run_batch(
+            [(combo, x0, groove_pitches, final_maxiter) for combo in combos],
+            total, _combo_label,
+        )
+        results = sorted(result_map.items(), key=lambda cr: cr[1]["cost"])
     else:
         total = sum(_halving_round_counts(n_combos, halving_rounds, top_k_final))
         history = {}
@@ -1441,28 +1639,34 @@ def auto_design(n_layers: int,
 
         for r in range(halving_rounds):
             budget = screen_maxiter * (2 ** r)
-            round_results = []
-            for combo in survivors:
-                x_start = history[combo]["params"] if combo in history else x0
-                res = _optimize_combo(combo, x_start, budget)
-                history[combo] = res
-                round_results.append((combo, res["cost"]))
-                step += 1
-                if progress_callback is not None:
-                    progress_callback(step, total, f"round {r + 1}: " + "/".join(combo))
-            round_results.sort(key=lambda cr: cr[1])
+            work_items = [
+                (
+                    combo,
+                    history[combo]["params"] if combo in history else x0,
+                    history[combo]["groove_pitches"] if combo in history else groove_pitches,
+                    budget,
+                )
+                for combo in survivors
+            ]
+            round_map = _run_batch(
+                work_items, total,
+                lambda combo, r=r: f"round {r + 1}: " + _combo_label(combo),
+            )
+            history.update(round_map)
+            round_results = sorted(
+                ((c, history[c]["cost"]) for c in survivors), key=lambda cr: cr[1])
             keep_n = max(top_k_final, len(round_results) // 2)
             survivors = [combo for combo, _ in round_results[:keep_n]]
 
         finalists = sorted(survivors, key=lambda c: history[c]["cost"])[:top_k_final]
-        results = []
-        for combo in finalists:
-            res = _optimize_combo(combo, history[combo]["params"], final_maxiter)
-            results.append((combo, res))
-            step += 1
-            if progress_callback is not None:
-                progress_callback(step, total, "final: " + "/".join(combo))
-        results.sort(key=lambda cr: cr[1]["cost"])
+        final_map = _run_batch(
+            [
+                (combo, history[combo]["params"], history[combo]["groove_pitches"], final_maxiter)
+                for combo in finalists
+            ],
+            total, lambda combo: "final: " + _combo_label(combo),
+        )
+        results = sorted(final_map.items(), key=lambda cr: cr[1]["cost"])
 
     best_combo, best_res = results[0]
     # Report an efficiency figure alongside cost, so a low-RMS combo that
@@ -1471,25 +1675,144 @@ def auto_design(n_layers: int,
     # cost that drove the search doesn't account for that at all.
     leaderboard = []
     for combo, res in results:
+        mat_names, surf_types = combo
         eff_vals = [
             optical_efficiency(res["system"].trace_bundle(rays_in, lam), len(rays_in))
             for lam in lam_list
         ]
         leaderboard.append({
-            "materials": list(combo),
+            "materials": list(mat_names),
+            "surface_types": list(surf_types),
             "cost": res["cost"],
             "params": res["params"],
+            "groove_pitches": res["groove_pitches"],
             "efficiency": float(np.mean(eff_vals)) if eff_vals else 0.0,
         })
 
     return {
         "best": best_res,
-        "best_materials": list(best_combo),
+        "best_materials": list(best_combo[0]),
+        "best_surface_types": list(best_combo[1]),
         "leaderboard": leaderboard,
         "n_combinations_total": n_combos,
-        "n_combinations_evaluated": step,
+        "n_combinations_evaluated": step_counter["n"],
         "used_halving": used_halving,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6c. TOLERANCING
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# An optically "best" design that collapses if a radius is off by 5 microns
+# isn't actually the best design to build. This does a one-at-a-time (OAT)
+# sensitivity sweep: perturb each geometry parameter by +/-delta from its
+# nominal value (holding everything else fixed), and report how much RMS
+# spot size and optical efficiency move — a standard, cheap first pass at
+# tolerancing before anything more elaborate (Monte Carlo over all
+# parameters simultaneously, decenter/tilt, etc.).
+
+def default_param_names(n_layers: int) -> list:
+    """['R0'..'Rn', 't1'..'tn', 'f'] — the flat-params ordering used
+    throughout (build_nlayer_system, optimize_lens, ...)."""
+    return (
+        [f"R{i}" for i in range(n_layers + 1)]
+        + [f"t{i + 1}" for i in range(n_layers)]
+        + ["f"]
+    )
+
+
+def tolerance_sensitivity(params, system_builder,
+                          lam_list=None, rays_in=None,
+                          param_names=None, delta=0.01e-3) -> list:
+    """
+    One-at-a-time tolerance sensitivity: for each parameter, evaluate the
+    design at (nominal + delta) and (nominal - delta), holding all other
+    parameters fixed, and report the resulting RMS spot size / optical
+    efficiency swing.
+
+    Parameters
+    ----------
+    params         : nominal flat parameter vector [R0..Rn, t1..tn, f] (metres)
+    system_builder : callable(params) -> LayeredLensSystem
+    lam_list, rays_in : as elsewhere; default LAMBDA_GRID / make_input_bundle().
+                     Averaged across the whole grid/bundle for each
+                     evaluation — the "honest" (not the fast/subsampled)
+                     way, since tolerancing needs one accurate evaluation
+                     per parameter, not thousands of coarse ones.
+    param_names    : display name per entry in params; defaults to
+                     default_param_names() inferred from len(params)
+    delta          : perturbation size [m], scalar (applied to every
+                     parameter) or a per-parameter sequence. Default 0.01mm
+                     — a representative precision-optics manufacturing
+                     tolerance; assembly tolerances (e.g. on f) are often
+                     coarser in practice, so pass a per-parameter sequence
+                     to reflect that.
+
+    Returns
+    -------
+    list of dicts, one per parameter:
+        'parameter', 'nominal', 'delta',
+        'rms_nominal_um', 'rms_plus_um', 'rms_minus_um',
+        'efficiency_nominal', 'efficiency_plus', 'efficiency_minus',
+        'rms_sensitivity_um_per_mm' — |d(RMS)/d(param)|, i.e. how many µm
+        of spot growth per mm of parameter error; the single number to sort
+        by when deciding which dimension needs tightest control.
+    """
+    params = np.asarray(params, dtype=float)
+    n_params = len(params)
+
+    if lam_list is None:
+        lam_list = LAMBDA_GRID
+    if rays_in is None:
+        rays_in = make_input_bundle()
+    if param_names is None:
+        n_layers = (n_params - 2) // 2
+        param_names = default_param_names(n_layers)
+    if np.isscalar(delta):
+        delta = [delta] * n_params
+
+    def _evaluate(p):
+        system = system_builder(p)
+        rms_vals, eff_vals = [], []
+        for lam in lam_list:
+            rays_out = system.trace_bundle(rays_in, lam)
+            rms_vals.append(rms_spot_radius(rays_out) if rays_out else float("inf"))
+            eff_vals.append(optical_efficiency(rays_out, len(rays_in)))
+        finite_rms = [v for v in rms_vals if np.isfinite(v)]
+        mean_rms = float(np.mean(finite_rms)) if finite_rms else float("inf")
+        return mean_rms, float(np.mean(eff_vals))
+
+    rms_nominal, eff_nominal = _evaluate(params)
+
+    results = []
+    for i, name in enumerate(param_names):
+        d = delta[i]
+        p_plus = params.copy();  p_plus[i]  += d
+        p_minus = params.copy(); p_minus[i] -= d
+        rms_plus, eff_plus = _evaluate(p_plus)
+        rms_minus, eff_minus = _evaluate(p_minus)
+
+        finite_swing = [v for v in (rms_plus, rms_minus) if np.isfinite(v)]
+        if len(finite_swing) == 2 and d > 0:
+            sensitivity = abs(rms_plus - rms_minus) / 2.0 / d * 1e-3  # um per mm
+        else:
+            sensitivity = float("inf")
+
+        results.append({
+            "parameter": name,
+            "nominal": float(params[i]),
+            "delta": d,
+            "rms_nominal_um": rms_nominal * 1e6,
+            "rms_plus_um": rms_plus * 1e6 if np.isfinite(rms_plus) else float("inf"),
+            "rms_minus_um": rms_minus * 1e6 if np.isfinite(rms_minus) else float("inf"),
+            "efficiency_nominal": eff_nominal,
+            "efficiency_plus": eff_plus,
+            "efficiency_minus": eff_minus,
+            "rms_sensitivity_um_per_mm": sensitivity,
+        })
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1828,6 +2151,117 @@ def run_tests():
     assert np.isfinite(opt23["cost"]), "FAIL [T23]: optimizer cost should be finite"
     print("  PASS [T23 Fresnel-surfaced system builds/traces/optimizes]")
 
+    # ── T24: irradiance_uniformity — structural + perfectly-uniform case ───
+    sys24 = build_2layer_system(np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3]))
+    rays_out24 = sys24.trace_bundle(make_input_bundle(radius=1e-3, n_rays=49), 550e-9)
+    u24 = irradiance_uniformity(rays_out24, cell_radius=0.5e-3, n_bins=5)
+    assert len(u24["bin_edges"]) == 6 and len(u24["irradiance"]) == 5, (
+        "FAIL [T24]: wrong bin_edges/irradiance shape")
+    if u24["peak_to_avg"] is not None:
+        assert u24["peak_to_avg"] >= 1.0 - 1e-9, "FAIL [T24]: peak_to_avg should be >= 1.0"
+        assert u24["cv"] >= 0.0, "FAIL [T24]: cv should be >= 0"
+
+    # A synthetic perfectly-uniform case: one ray per bin, equal power,
+    # placed at each bin's center radius -> equal irradiance per unit area
+    # only if we also equalize per-bin ray count vs. area, so instead just
+    # check the *degenerate* single-bin case is exactly uniform (peak_to_avg==1).
+    single_bin_rays = [Ray([0.1e-3, 0.0, 0.0], [0, 0, 1]), Ray([0.3e-3, 0.0, 0.0], [0, 0, 1])]
+    for r in single_bin_rays:
+        r.power = 1.0
+    u24b = irradiance_uniformity(single_bin_rays, cell_radius=0.5e-3, n_bins=1)
+    _assert_close(u24b["peak_to_avg"], 1.0, tol=1e-9, label="T24b single-bin case is trivially uniform")
+    print("  PASS [T24 irradiance_uniformity structural sanity]")
+
+    # ── T25: tolerance_sensitivity — structural sanity ──────────────────────
+    x0_25 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    tol25 = tolerance_sensitivity(
+        x0_25, lambda p: build_2layer_system(p),
+        lam_list=np.linspace(400e-9, 1100e-9, 5),
+        rays_in=make_input_bundle(radius=1e-3, n_rays=25),
+        delta=0.01e-3,
+    )
+    assert len(tol25) == 6, "FAIL [T25]: expected 6 entries (R0,R1,R2,t1,t2,f)"
+    assert [t["parameter"] for t in tol25] == ["R0", "R1", "R2", "t1", "t2", "f"], (
+        "FAIL [T25]: unexpected parameter names/order")
+    for entry in tol25:
+        assert np.isfinite(entry["rms_nominal_um"]), f"FAIL [T25]: non-finite nominal RMS for {entry['parameter']}"
+        assert 0.0 <= entry["efficiency_nominal"] <= 1.0, (
+            f"FAIL [T25]: implausible efficiency for {entry['parameter']}")
+    print("  PASS [T25 tolerance_sensitivity structural sanity]")
+
+    # ── T26: auto_design parallel (max_workers>1) matches sequential ───────
+    x0_26 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    names_26 = ["N-BK7", "F2", "SF11"]
+    ad_seq = auto_design(n_layers=2, x0=x0_26, material_names=names_26,
+                         full_optimize_threshold=100, final_maxiter=20, max_workers=1)
+    ad_par = auto_design(n_layers=2, x0=x0_26, material_names=names_26,
+                         full_optimize_threshold=100, final_maxiter=20, max_workers=4)
+    assert ad_seq["best_materials"] == ad_par["best_materials"], (
+        "FAIL [T26]: parallel and sequential auto_design picked different winners")
+    _assert_close(ad_seq["best"]["cost"], ad_par["best"]["cost"], tol=1e-12,
+                  label="T26 parallel auto_design matches sequential (full-optimize path)")
+
+    ad_seq_h = auto_design(n_layers=2, x0=x0_26, material_names=None,
+                           full_optimize_threshold=0, screen_maxiter=5, halving_rounds=2,
+                           top_k_final=2, final_maxiter=15, max_workers=1)
+    ad_par_h = auto_design(n_layers=2, x0=x0_26, material_names=None,
+                           full_optimize_threshold=0, screen_maxiter=5, halving_rounds=2,
+                           top_k_final=2, final_maxiter=15, max_workers=4)
+    assert ad_seq_h["best_materials"] == ad_par_h["best_materials"], (
+        "FAIL [T26b]: parallel and sequential auto_design (halving) picked different winners")
+    _assert_close(ad_seq_h["best"]["cost"], ad_par_h["best"]["cost"], tol=1e-12,
+                  label="T26b parallel auto_design matches sequential (halving path)")
+
+    # ── T27: optimize_lens actually searches groove pitch (not silently
+    #         ignored), and can be told not to ────────────────────────────
+    p27 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    surf27 = ["fresnel", "spherical", "spherical"]
+    pitch27 = [0.2e-3, None, None]
+
+    opt27_search = optimize_lens(
+        x0=p27, maxiter=60, surface_types=surf27, groove_pitches=pitch27,
+        optimize_groove_pitch=True,
+    )
+    assert opt27_search["params"].shape == (6,), (
+        "FAIL [T27]: 'params' should stay geometry-only (6 values), pitch reported separately")
+    assert opt27_search["groove_pitches"][1] is None and opt27_search["groove_pitches"][2] is None, (
+        "FAIL [T27]: non-Fresnel surfaces should report groove_pitches=None")
+    assert opt27_search["groove_pitches"][0] != pitch27[0], (
+        "FAIL [T27]: optimized pitch should have moved from its starting value")
+    assert opt27_search["groove_pitches"][0] >= MIN_GROOVE_PITCH - 1e-12, (
+        "FAIL [T27]: optimized pitch should respect the minimum-pitch guard")
+
+    opt27_fixed = optimize_lens(
+        x0=p27, maxiter=60, surface_types=surf27, groove_pitches=pitch27,
+        optimize_groove_pitch=False,
+    )
+    _assert_close(opt27_fixed["groove_pitches"][0], pitch27[0], tol=1e-15,
+                  label="T27 optimize_groove_pitch=False holds pitch exactly fixed")
+    print(f"  PASS [T27 groove pitch is searched "
+          f"({pitch27[0] * 1e3:.4f}mm -> {opt27_search['groove_pitches'][0] * 1e3:.4f}mm)]")
+
+    # ── T28: auto_design search_surface_types explores multiple surface-type
+    #         assignments and reports the winner's ─────────────────────────
+    x0_28 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    ad28 = auto_design(
+        n_layers=2, x0=x0_28, material_names=["N-BK7", "F2"],
+        search_surface_types=True, full_optimize_threshold=100,
+        final_maxiter=15, max_workers=1,
+    )
+    # 2 material combos * 2^3 surface-type combos = 16
+    assert ad28["n_combinations_total"] == 2 * 8, (
+        "FAIL [T28]: expected 2 material combos x 8 surface-type combos = 16")
+    assert len(ad28["best_surface_types"]) == 3, "FAIL [T28]: expected 3 surface types (2 layers)"
+    assert all(t in ("spherical", "fresnel") for t in ad28["best_surface_types"]), (
+        "FAIL [T28]: unexpected surface type value")
+    assert ad28["best"]["system"].surfaces[0].surface_type == ad28["best_surface_types"][0], (
+        "FAIL [T28]: winning system's surface types should match best_surface_types")
+    for entry in ad28["leaderboard"]:
+        assert len(entry["surface_types"]) == 3
+        assert len(entry["groove_pitches"]) == 3
+    print(f"  PASS [T28 auto_design search_surface_types "
+          f"(winner: {'/'.join(ad28['best_surface_types'])})]")
+
     print("\nAll tests PASSED.\n")
 
 
@@ -1836,28 +2270,31 @@ def run_tests():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wavelength_to_rgb(lam: float):
-    """Approximate wavelength [m] → (R, G, B) for plotting."""
+    """
+    Wavelength [m] -> (R, G, B) in [0,1], using named spectral bands:
+        Violet  400-450 nm   Blue    450-495 nm   Green  495-570 nm
+        Yellow  570-590 nm   Orange  590-620 nm   Red    620-700 nm
+    Below 400 nm clamps to Violet. Above 700 nm — this tool traces out to
+    1100 nm for silicon PV's near-IR response — fades from Red toward a
+    dark maroon as an intuitive "beyond visible, into the IR" cue rather
+    than snapping to a flat color.
+    """
     nm = lam * 1e9
-    if   nm < 380:              return (0.5, 0.0, 0.5)
-    elif nm < 440:
-        r = (440 - nm) / 60.0
-        return (r, 0.0, 1.0)
-    elif nm < 490:
-        g = (nm - 440) / 50.0
-        return (0.0, g, 1.0)
-    elif nm < 510:
-        b = (510 - nm) / 20.0
-        return (0.0, 1.0, b)
-    elif nm < 580:
-        r = (nm - 510) / 70.0
-        return (r, 1.0, 0.0)
-    elif nm < 645:
-        g = (645 - nm) / 65.0
-        return (1.0, g, 0.0)
-    elif nm <= 780:
-        return (1.0, 0.0, 0.0)
+    if nm < 450:
+        return (148 / 255, 0.0, 211 / 255)      # Violet (also covers < 400 nm)
+    elif nm < 495:
+        return (0.0, 0.0, 1.0)                   # Blue
+    elif nm < 570:
+        return (0.0, 1.0, 0.0)                   # Green
+    elif nm < 590:
+        return (1.0, 1.0, 0.0)                   # Yellow
+    elif nm < 620:
+        return (1.0, 165 / 255, 0.0)             # Orange
+    elif nm <= 700:
+        return (1.0, 0.0, 0.0)                   # Red
     else:
-        return (0.8, 0.0, 0.0)
+        frac = min((nm - 700) / 400.0, 1.0)      # fade toward dark maroon by 1100 nm
+        return (1.0 - 0.7 * frac, 0.0, 0.0)
 
 
 def plot_spot_diagrams(system: LayeredLensSystem,
