@@ -337,7 +337,7 @@ def plot_spots_plotly(values):
         fig.add_shape(
             type="circle",
             x0=-cell_radius_um, y0=-cell_radius_um, x1=cell_radius_um, y1=cell_radius_um,
-            line=dict(color="black", dash="dot", width=1.5),
+            line=dict(color="white", dash="dot", width=1.5),
             row=row, col=col,
         )
         fig.update_xaxes(title_text="x (µm)", zeroline=True, row=row, col=col)
