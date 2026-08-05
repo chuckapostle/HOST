@@ -66,13 +66,85 @@ def ray_sphere_intersect(origin, direction, center, radius):
     sqrt_disc = np.sqrt(disc)
     t = (-b - sqrt_disc) / (2.0 * a)  # nearest root
 
-    if t <= 1e-9:                      # try the farther root
+    # A ray legitimately starting exactly on the surface (t == 0, e.g. the
+    # on-axis ray of an input bundle seeded at z=0 against a surface whose
+    # own vertex is at z=0 by convention) must be accepted, not treated as
+    # "behind the ray" — only a genuinely negative near root falls back to
+    # the farther one (e.g. a ray already inside the sphere).
+    if t < -1e-9:                      # try the farther root
         t = (-b + sqrt_disc) / (2.0 * a)
-    if t <= 1e-9:
-        return None, None, None
+        if t <= 1e-9:
+            return None, None, None
+    else:
+        t = max(t, 0.0)
 
     p = O + t * D
     n = (p - C) / np.linalg.norm(p - C)
+    return t, p, n
+
+
+def ray_fresnel_intersect(origin, direction, center, radius, groove_pitch):
+    """
+    Intersect a ray with a Fresnel-faceted approximation of a sphere.
+
+    Models a Fresnel lens the standard "thin facet" way used in geometric
+    (non-wave-optics) ray tracing: the physical surface is collapsed onto
+    the flat vertex plane (real groove depths are tiny compared to the rest
+    of the system), split into concentric annular zones of radial width
+    `groove_pitch`. Within each zone the ray sees a single flat facet whose
+    NORMAL matches the parent sphere's normal at that zone's center radius
+    — the facet doesn't reproduce the sphere's shape, but it reproduces the
+    parent sphere's local ray-bending direction, which is what a groove
+    aims to do. Fewer/coarser zones (larger groove_pitch) means more
+    faceting error, mirroring the real manufacturing tradeoff.
+
+    Parameters
+    ----------
+    origin, direction : (3,) arrays – ray origin / unit direction
+    center             : (3,) array – parent sphere's center (same
+                          convention as ray_sphere_intersect / Surface)
+    radius             : float – parent sphere's signed radius
+    groove_pitch       : float – radial width of each zone [m]
+
+    Returns
+    -------
+    t : float or None
+    p : (3,) array or None – point on the flat vertex plane
+    n : (3,) array or None – parent-sphere normal at the zone's center radius
+    """
+    O = np.asarray(origin,    dtype=float)
+    D = np.asarray(direction, dtype=float)
+    C = np.asarray(center,    dtype=float)
+    R = float(radius)
+
+    if abs(D[2]) < 1e-12:
+        return None, None, None
+
+    z0 = C[2] - R  # vertex z (same relationship build_layered_system uses)
+    t = (z0 - O[2]) / D[2]
+    # Accept a ray legitimately starting exactly on the flat facet plane
+    # (t == 0) — see ray_sphere_intersect() for why only a genuinely
+    # negative t is rejected as "behind the ray".
+    if t < -1e-9:
+        return None, None, None
+    t = max(t, 0.0)
+
+    p = O + t * D
+    rho = float(np.hypot(p[0], p[1]))
+    zone = np.floor(rho / groove_pitch)
+    rho_ref = (zone + 0.5) * groove_pitch
+
+    if rho > 1e-12:
+        ux, uy = p[0] / rho, p[1] / rho
+    else:
+        ux, uy = 0.0, 0.0
+
+    inside = max(R * R - rho_ref * rho_ref, 0.0)
+    sign = 1.0 if R >= 0.0 else -1.0
+    z_ref = C[2] - sign * np.sqrt(inside)
+    point_ref = np.array([rho_ref * ux, rho_ref * uy, z_ref])
+
+    n = (point_ref - C) / abs(R)
     return t, p, n
 
 
@@ -196,18 +268,62 @@ def _ray_sphere_intersect_batch(O, D, center, radius):
     t_near = np.full_like(disc, np.nan)
     t_near[hit] = (-b[hit] - sqrt_disc[hit]) / (2.0 * a[hit])
 
-    use_far = hit & (t_near <= 1e-9)
-    t_far = np.full_like(disc, np.nan)
-    t_far[hit] = (-b[hit] + sqrt_disc[hit]) / (2.0 * a[hit])
+    # A ray legitimately starting exactly on the surface (t == 0) must be
+    # accepted, not treated as "behind the ray" — see the scalar
+    # ray_sphere_intersect() for why. Only fall back to the farther root
+    # when the near one is genuinely negative.
+    near_ok = hit & (t_near >= -1e-9)
+    t_near_clamped = np.where(near_ok, np.maximum(t_near, 0.0), np.nan)
 
-    t = np.where(use_far, t_far, t_near)
-    hit = hit & (t > 1e-9)
+    far_case = hit & ~near_ok
+    t_far = np.full_like(disc, np.nan)
+    t_far[far_case] = (-b[far_case] + sqrt_disc[far_case]) / (2.0 * a[far_case])
+    far_ok = far_case & (t_far > 1e-9)
+
+    t = np.where(near_ok, t_near_clamped, t_far)
+    hit = near_ok | far_ok
 
     p = O + t[:, None] * D
     diff = p - center
     norm = np.linalg.norm(diff, axis=1, keepdims=True)
     norm_safe = np.where(norm < 1e-12, 1.0, norm)
     n = diff / norm_safe
+
+    return p, n, hit
+
+
+def _fresnel_intersect_batch(O, D, center, radius, groove_pitch):
+    """
+    Vectorized counterpart of ray_fresnel_intersect() — see that function's
+    docstring for the physical model. Same (p, n, hit) contract as
+    _ray_sphere_intersect_batch().
+    """
+    Dz = D[:, 2]
+    hit = np.abs(Dz) >= 1e-12
+    Dz_safe = np.where(hit, Dz, 1.0)
+
+    z0 = center[2] - radius
+    t = (z0 - O[:, 2]) / Dz_safe
+    # Accept t == 0 (ray starting exactly on the facet plane) — see
+    # ray_sphere_intersect() for why only genuinely negative t is rejected.
+    hit = hit & (t > -1e-9)
+    t = np.maximum(t, 0.0)
+
+    p = O + t[:, None] * D
+    rho = np.hypot(p[:, 0], p[:, 1])
+    zone = np.floor(rho / groove_pitch)
+    rho_ref = (zone + 0.5) * groove_pitch
+
+    rho_safe = np.where(rho > 1e-12, rho, 1.0)
+    ux = np.where(rho > 1e-12, p[:, 0] / rho_safe, 0.0)
+    uy = np.where(rho > 1e-12, p[:, 1] / rho_safe, 0.0)
+
+    sign = 1.0 if radius >= 0.0 else -1.0
+    inside = np.maximum(radius * radius - rho_ref * rho_ref, 0.0)
+    z_ref = center[2] - sign * np.sqrt(inside)
+
+    point_ref = np.stack([rho_ref * ux, rho_ref * uy, z_ref], axis=1)
+    n = (point_ref - center) / abs(radius)
 
     return p, n, hit
 
@@ -403,24 +519,38 @@ class Ray:
 
 class Surface:
     """
-    Spherical refracting surface separating two optical media.
+    Refracting surface separating two optical media — either a continuous
+    sphere, or a Fresnel-faceted approximation of one (see
+    ray_fresnel_intersect() for the physical model).
 
     Parameters
     ----------
-    center    : (3,) – sphere centre (defines vertex position and z-location)
-    radius    : float – signed radius of curvature
-                  > 0  →  centre of curvature is to the right (+z)
-                  < 0  →  centre of curvature is to the left  (−z)
-                  ±inf →  flat surface (treated as very large sphere)
-    mat_left  : Material on the –z side  (None → AIR)
-    mat_right : Material on the +z side  (None → AIR)
+    center       : (3,) – parent sphere's centre (defines vertex position
+                   and z-location; a Fresnel surface still has one, since
+                   it's a faceted approximation of this same sphere)
+    radius       : float – signed radius of curvature
+                     > 0  →  centre of curvature is to the right (+z)
+                     < 0  →  centre of curvature is to the left  (−z)
+                     ±inf →  flat surface (treated as very large sphere)
+    mat_left     : Material on the –z side  (None → AIR)
+    mat_right    : Material on the +z side  (None → AIR)
+    surface_type : "spherical" (default) or "fresnel"
+    groove_pitch : float – radial zone width [m], required if
+                   surface_type == "fresnel"
     """
 
-    def __init__(self, center, radius, mat_left=None, mat_right=None):
+    def __init__(self, center, radius, mat_left=None, mat_right=None,
+                 surface_type="spherical", groove_pitch=None):
         self.center    = np.array(center, dtype=float)
         self.R         = float(radius)
         self.mat_left  = mat_left  or AIR
         self.mat_right = mat_right or AIR
+        if surface_type not in ("spherical", "fresnel"):
+            raise ValueError(f"Unknown surface_type '{surface_type}'.")
+        if surface_type == "fresnel" and not groove_pitch:
+            raise ValueError("groove_pitch is required for a fresnel surface_type.")
+        self.surface_type = surface_type
+        self.groove_pitch = groove_pitch
 
     # ── Intersection ──────────────────────────────────────────────────────
     def intersect(self, ray: Ray):
@@ -428,7 +558,10 @@ class Surface:
         Returns (point, normal) of the nearest intersection, or (None, None).
         Normal is oriented to point from left medium toward right medium.
         """
-        t, p, n = ray_sphere_intersect(ray.o, ray.d, self.center, self.R)
+        if self.surface_type == "fresnel":
+            t, p, n = ray_fresnel_intersect(ray.o, ray.d, self.center, self.R, self.groove_pitch)
+        else:
+            t, p, n = ray_sphere_intersect(ray.o, ray.d, self.center, self.R)
         if p is None:
             return None, None
 
@@ -481,7 +614,10 @@ class Surface:
 
         Returns (O_new, D_new, power_new, alive_new).
         """
-        p, n, hit = _ray_sphere_intersect_batch(O, D, self.center, self.R)
+        if self.surface_type == "fresnel":
+            p, n, hit = _fresnel_intersect_batch(O, D, self.center, self.R, self.groove_pitch)
+        else:
+            p, n, hit = _ray_sphere_intersect_batch(O, D, self.center, self.R)
         still = alive & hit
 
         if going_forward:
@@ -919,26 +1055,39 @@ def concentration_acceptance_product(system: LayeredLensSystem,
 MIN_LAYER_THICKNESS = 0.5e-3  # guard: keep layer thicknesses positive and sensible
 
 
-def build_layered_system(radii, thicknesses, materials, f) -> LayeredLensSystem:
+def build_layered_system(radii, thicknesses, materials, f,
+                         surface_types=None, groove_pitches=None) -> LayeredLensSystem:
     """
     Build an N-layer layered lens system (air on both ends).
 
     Parameters
     ----------
-    radii       : sequence of N+1 signed radii of curvature [m], one per
-                  surface (entry, N-1 internal, exit)
-    thicknesses : sequence of N thicknesses [m], one per material layer
-    materials   : sequence of N Material objects, one per layer
-    f           : target focal length / PV-plane z-position [m]
+    radii          : sequence of N+1 signed radii of curvature [m], one per
+                     surface (entry, N-1 internal, exit)
+    thicknesses    : sequence of N thicknesses [m], one per material layer
+    materials      : sequence of N Material objects, one per layer
+    f              : target focal length / PV-plane z-position [m]
+    surface_types  : sequence of N+1 "spherical"/"fresnel" strings, one per
+                     surface; defaults to all "spherical" (unchanged
+                     behaviour). Fixed/chosen by the caller, not something
+                     the optimizer searches over — see optimize_lens().
+    groove_pitches : sequence of N+1 groove pitches [m] (or None where not
+                     applicable), required alongside surface_types wherever
+                     it says "fresnel"
     """
     radii = np.asarray(radii, dtype=float)
     n_layers = len(materials)
-    if len(radii) != n_layers + 1:
+    n_surfaces = n_layers + 1
+    if len(radii) != n_surfaces:
         raise ValueError(
-            f"Expected {n_layers + 1} radii for {n_layers} layers, got {len(radii)}.")
+            f"Expected {n_surfaces} radii for {n_layers} layers, got {len(radii)}.")
     if len(thicknesses) != n_layers:
         raise ValueError(
             f"Expected {n_layers} thicknesses for {n_layers} layers, got {len(thicknesses)}.")
+    if surface_types is None:
+        surface_types = ["spherical"] * n_surfaces
+    if groove_pitches is None:
+        groove_pitches = [None] * n_surfaces
 
     thicknesses = [max(float(t), MIN_LAYER_THICKNESS) for t in thicknesses]
 
@@ -948,21 +1097,25 @@ def build_layered_system(radii, thicknesses, materials, f) -> LayeredLensSystem:
     for i in range(n_layers):
         mat_right = materials[i]
         center = np.array([0.0, 0.0, z + radii[i]])
-        surfaces.append(Surface(center, radii[i], mat_left, mat_right))
+        surfaces.append(Surface(center, radii[i], mat_left, mat_right,
+                                surface_type=surface_types[i], groove_pitch=groove_pitches[i]))
         z += thicknesses[i]
         mat_left = mat_right
 
     # Exit surface back to air
     center_exit = np.array([0.0, 0.0, z + radii[n_layers]])
-    surfaces.append(Surface(center_exit, radii[n_layers], mat_left, AIR))
+    surfaces.append(Surface(center_exit, radii[n_layers], mat_left, AIR,
+                            surface_type=surface_types[n_layers], groove_pitch=groove_pitches[n_layers]))
 
     return LayeredLensSystem(surfaces, z_target=f)
 
 
-def build_nlayer_system(params, materials) -> LayeredLensSystem:
+def build_nlayer_system(params, materials, surface_types=None, groove_pitches=None) -> LayeredLensSystem:
     """
     Build a layered system from a flat parameter vector
-    [R0..Rn, t1..tn, f] and a list of N Material objects.
+    [R0..Rn, t1..tn, f] and a list of N Material objects. surface_types /
+    groove_pitches are passed straight through to build_layered_system() —
+    they're fixed configuration, not part of the optimizable params vector.
     """
     params = np.asarray(params, dtype=float)
     n_layers = len(materials)
@@ -976,12 +1129,15 @@ def build_nlayer_system(params, materials) -> LayeredLensSystem:
     thicknesses = params[n_layers + 1:2 * n_layers + 1]
     f = params[2 * n_layers + 1]
 
-    return build_layered_system(radii, thicknesses, materials, f)
+    return build_layered_system(radii, thicknesses, materials, f,
+                                surface_types=surface_types, groove_pitches=groove_pitches)
 
 
 def build_2layer_system(params,
                         mat1: Material = None,
-                        mat2: Material = None) -> LayeredLensSystem:
+                        mat2: Material = None,
+                        surface_types=None,
+                        groove_pitches=None) -> LayeredLensSystem:
     """
     Build a 3-surface, 2-material layered lens system.
 
@@ -994,7 +1150,8 @@ def build_2layer_system(params,
     if mat2 is None:
         mat2 = Material.F2()
 
-    return build_nlayer_system(params, [mat1, mat2])
+    return build_nlayer_system(params, [mat1, mat2],
+                               surface_types=surface_types, groove_pitches=groove_pitches)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1009,6 +1166,8 @@ def optimize_lens(materials=None,
                   maxiter: int = 1500,
                   lam_list=None,
                   rays_in=None,
+                  surface_types=None,
+                  groove_pitches=None,
                   progress_callback=None) -> dict:
     """
     Minimise concentration_cost for an N-layer lens stack.
@@ -1030,6 +1189,14 @@ def optimize_lens(materials=None,
                          defaults to LAMBDA_GRID
     rays_in           : illumination bundle used the same way; defaults to
                          make_input_bundle()
+    surface_types     : per-surface "spherical"/"fresnel" list, passed
+                         straight through to build_layered_system() — a
+                         fixed choice, not something this optimizer searches
+                         over (surface type is categorical, not a continuum
+                         Nelder-Mead/Powell can move through). Defaults to
+                         all-spherical.
+    groove_pitches    : per-surface groove pitch [m], required wherever
+                         surface_types says "fresnel"
     progress_callback : optional callable(iteration:int, maxiter:int),
                          invoked after every scipy.optimize iteration —
                          lets a caller (e.g. a UI) drive a progress bar.
@@ -1062,7 +1229,8 @@ def optimize_lens(materials=None,
         rays_in = make_input_bundle()
 
     def builder(p):
-        return build_nlayer_system(p, materials)
+        return build_nlayer_system(p, materials, surface_types=surface_types,
+                                   groove_pitches=groove_pitches)
 
     # ── Fast coarse cost (fewer rays + coarser λ grid) used during search ──
     # Subsampled from the caller's own grid/bundle, capped at ~7 wavelengths
@@ -1192,6 +1360,8 @@ def auto_design(n_layers: int,
                 halving_rounds: int = 3,
                 top_k_final: int = 3,
                 final_maxiter: int = 500,
+                surface_types=None,
+                groove_pitches=None,
                 progress_callback=None) -> dict:
     """
     Jointly search material combinations and geometry for the best N-layer
@@ -1216,6 +1386,11 @@ def auto_design(n_layers: int,
                                optimize_lens() run at the end
     final_maxiter           : iteration budget for the full-optimize path and
                                the final pass of the halving path
+    surface_types           : per-surface "spherical"/"fresnel" list, fixed
+                               for every combination searched (see
+                               optimize_lens() — this isn't part of the
+                               search space, only geometry and materials are)
+    groove_pitches          : per-surface groove pitch [m], as above
     progress_callback       : optional callable(step:int, total:int, label:str)
 
     Returns
@@ -1224,8 +1399,8 @@ def auto_design(n_layers: int,
         'best'                     : optimize_lens()-style result dict for
                                       the winning combination
         'best_materials'           : list of material names for the winner
-        'leaderboard'              : list of {'materials','cost','params'}
-                                      dicts, best first
+        'leaderboard'              : list of {'materials','cost','params',
+                                      'efficiency'} dicts, best first
         'n_combinations_total'     : number of combinations considered
         'n_combinations_evaluated' : number of optimize_lens() calls made
         'used_halving'             : whether the halving path was taken
@@ -1243,7 +1418,8 @@ def auto_design(n_layers: int,
     def _optimize_combo(combo, x_start, maxiter):
         materials = [CANDIDATE_MATERIALS[name] for name in combo]
         return optimize_lens(materials=materials, x0=x_start, method=method,
-                             maxiter=maxiter, lam_list=lam_list, rays_in=rays_in)
+                             maxiter=maxiter, lam_list=lam_list, rays_in=rays_in,
+                             surface_types=surface_types, groove_pitches=groove_pitches)
 
     step = 0
     used_halving = n_combos > full_optimize_threshold
@@ -1576,6 +1752,82 @@ def run_tests():
         assert cap20["CAP"] is not None and cap20["CAP"] > 0, "FAIL [T20]: CAP should be positive when found"
     print("  PASS [T20 acceptance-angle scan / CAP structural sanity]")
 
+    # ── T21: Fresnel facet matches parent sphere exactly at zone centers ───
+    R21, pitch21 = 50e-3, 0.2e-3
+    center21 = np.array([0.0, 0.0, R21])  # vertex at z=0
+    glass21 = Material.BK7()
+    sph21 = Surface(center21, R21, AIR, glass21, surface_type="spherical")
+    fres21 = Surface(center21, R21, AIR, glass21, surface_type="fresnel", groove_pitch=pitch21)
+    lam21 = 550e-9
+
+    max_zone_center_diff = 0.0
+    for zone_idx in range(4):
+        x21 = (zone_idx + 0.5) * pitch21  # exactly a zone center
+        ray21 = Ray([x21, 0.0, -1e-3], [0.0, 0.0, 1.0])
+        r_sph21 = sph21.refract(ray21.copy(), lam21)
+        r_fres21 = fres21.refract(ray21.copy(), lam21)
+        assert r_sph21 is not None and r_fres21 is not None, (
+            "FAIL [T21]: expected both surfaces to refract this ray")
+        max_zone_center_diff = max(max_zone_center_diff,
+                                   np.max(np.abs(r_sph21.d - r_fres21.d)))
+    _assert_close(max_zone_center_diff, 0.0, tol=1e-9,
+                  label="T21 Fresnel facet direction matches parent sphere at zone centers")
+
+    # Off zone-center: still a real refraction (not a miss), and close to the
+    # parent sphere's direction (faceting error, not a different physics model)
+    ray21b = Ray([0.55e-3, 0.0, -1e-3], [0.0, 0.0, 1.0])
+    r_sph21b = sph21.refract(ray21b.copy(), lam21)
+    r_fres21b = fres21.refract(ray21b.copy(), lam21)
+    assert r_sph21b is not None and r_fres21b is not None
+    off_center_diff = np.max(np.abs(r_sph21b.d - r_fres21b.d))
+    assert 0.0 < off_center_diff < 1e-2, (
+        "FAIL [T21b]: off-zone-center faceting error should be small but nonzero")
+    print(f"  PASS [T21b off-zone-center faceting error is small ({off_center_diff:.2e})]")
+
+    # ── T22: vectorized Fresnel batch matches scalar reference ─────────────
+    # Rays must start *before* the surface (fres21's vertex is at z=0, same
+    # as make_ray_fan()'s default origin) or every ray starts exactly on it.
+    fan22 = [Ray(r.o - np.array([0.0, 0.0, 1e-3]), r.d) for r in make_ray_fan(radius=1e-3, n_rays=25)]
+    max_diff22 = 0.0
+    n_checked22 = 0
+    for r in fan22:
+        ref22 = fres21.refract(r.copy(), lam21)
+        batch_O = np.array([r.o])
+        batch_D = np.array([r.d])
+        batch_power = np.array([r.power])
+        batch_alive = np.array([True])
+        O_new, D_new, power_new, alive_new = fres21.refract_batch(
+            batch_O, batch_D, batch_power, batch_alive, lam21)
+        ref_alive = ref22 is not None
+        assert bool(alive_new[0]) == ref_alive, (
+            "FAIL [T22]: scalar/vectorized Fresnel disagree on survival")
+        if ref_alive:
+            n_checked22 += 1
+            max_diff22 = max(max_diff22, np.max(np.abs(D_new[0] - ref22.d)))
+    assert n_checked22 > 0, "FAIL [T22]: sanity check, no rays survived"
+    _assert_close(max_diff22, 0.0, tol=1e-9,
+                  label=f"T22 vectorized Fresnel matches scalar ({n_checked22} rays)")
+
+    # ── T23: a Fresnel-surfaced system builds, traces, and optimizes ───────
+    p23 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
+    sys23 = build_2layer_system(
+        p23, surface_types=["fresnel", "spherical", "spherical"],
+        groove_pitches=[0.2e-3, None, None],
+    )
+    assert sys23.surfaces[0].surface_type == "fresnel"
+    out23 = sys23.trace_bundle(make_input_bundle(radius=1e-3, n_rays=25), 550e-9)
+    assert len(out23) > 0, "FAIL [T23]: expected at least some rays to survive"
+
+    opt23 = optimize_lens(
+        x0=p23, maxiter=15,
+        surface_types=["fresnel", "spherical", "spherical"],
+        groove_pitches=[0.2e-3, None, None],
+    )
+    assert opt23["system"].surfaces[0].surface_type == "fresnel", (
+        "FAIL [T23]: optimizer's returned system should keep the Fresnel surface type")
+    assert np.isfinite(opt23["cost"]), "FAIL [T23]: optimizer cost should be finite"
+    print("  PASS [T23 Fresnel-surfaced system builds/traces/optimizes]")
+
     print("\nAll tests PASSED.\n")
 
 
@@ -1784,13 +2036,15 @@ CANDIDATE_MATERIALS = {
 }
 
 
-def material_survey(x0=None, verbose=True, lam_list=None, rays_in=None) -> list:
+def material_survey(x0=None, verbose=True, lam_list=None, rays_in=None,
+                    surface_types=None, groove_pitches=None) -> list:
     """
     Evaluate concentration_cost for every (mat1, mat2) pair and return
     a ranked list of (cost, mat1_name, mat2_name).
 
     lam_list / rays_in default to LAMBDA_GRID / make_input_bundle() when
-    omitted, matching the previous fixed-grid behaviour.
+    omitted, matching the previous fixed-grid behaviour. surface_types /
+    groove_pitches (fixed for every pair screened) default to all-spherical.
     """
     if x0 is None:
         x0 = np.array([50e-3, -30e-3, -50e-3, 5e-3, 5e-3, 50e-3])
@@ -1805,7 +2059,9 @@ def material_survey(x0=None, verbose=True, lam_list=None, rays_in=None) -> list:
             m1 = CANDIDATE_MATERIALS[n1_name]
             m2 = CANDIDATE_MATERIALS[n2_name]
             cost = concentration_cost(
-                x0, lambda p: build_2layer_system(p, mat1=m1, mat2=m2),
+                x0, lambda p: build_2layer_system(
+                    p, mat1=m1, mat2=m2,
+                    surface_types=surface_types, groove_pitches=groove_pitches),
                 lam_list=lam_list, rays_in=rays_in)
             scores.append((cost, n1_name, n2_name))
 

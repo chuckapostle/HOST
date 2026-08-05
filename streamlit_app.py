@@ -21,6 +21,7 @@ MAX_LAYERS = 4
 DEFAULT_RADII_MM = [50.0, -30.0, -50.0, -70.0, -90.0]
 DEFAULT_THICKNESS_MM = 5.0
 DEFAULT_MATERIALS_CYCLE = ["N-BK7", "F2"]
+DEFAULT_GROOVE_PITCH_MM = 0.2
 
 DEFAULTS = {
     "n_layers": 2,
@@ -70,9 +71,22 @@ def get_rays_in(values):
     )
 
 
+def get_groove_pitches_m(values):
+    return [(p * 1e-3 if p is not None else None) for p in values["groove_pitches_mm"]]
+
+
 def _wavelength_color(lam):
     r, g, b = optics._wavelength_to_rgb(lam)
     return f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"
+
+
+def _wavelength_cell_style(nm_value):
+    """Background-color a table cell by its spectral color, with readable
+    text — a quick-glance color legend baked right into the results table."""
+    r, g, b = optics._wavelength_to_rgb(nm_value * 1e-9)
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    text_color = "white" if luminance < 0.6 else "black"
+    return f"background-color: rgb({int(r * 255)},{int(g * 255)},{int(b * 255)}); color: {text_color}"
 
 
 def _axis_id(idx, letter):
@@ -96,7 +110,10 @@ def make_system(values):
     materials = get_materials(values)
     radii = np.array(values["radii_mm"], dtype=float) * 1e-3
     thicknesses = np.array(values["thicknesses_mm"], dtype=float) * 1e-3
-    return optics.build_layered_system(radii, thicknesses, materials, values["f_mm"] * 1e-3)
+    return optics.build_layered_system(
+        radii, thicknesses, materials, values["f_mm"] * 1e-3,
+        surface_types=values["surface_types"], groove_pitches=get_groove_pitches_m(values),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,11 +183,45 @@ def per_wavelength_metrics(values):
     return pd.DataFrame(rows), weighted_cost
 
 
+def _fresnel_zone_profile(R, cx, cz, aperture_half, pitch):
+    """
+    Sawtooth cross-section for a Fresnel surface, for drawing only. Each
+    zone's facet is a straight segment whose slope matches the parent
+    sphere's tangent at that zone's center radius, resetting to the flat
+    vertex plane at each zone boundary — a schematic (not literal-depth)
+    rendering, consistent with how ray_fresnel_intersect() itself treats
+    each zone as flat with a matching normal rather than modeling the
+    physical groove depth.
+    """
+    z0 = cz - R
+    sign = 1.0 if R >= 0 else -1.0
+    n_zones = max(int(np.ceil(aperture_half / pitch)), 1)
+
+    xs, zs = [], []
+    for k in range(n_zones):
+        rho_start = k * pitch
+        if rho_start >= aperture_half:
+            break
+        rho_end = min((k + 1) * pitch, aperture_half)
+        rho_ref = min((k + 0.5) * pitch, aperture_half)
+        inside = max(R * R - rho_ref * rho_ref, 1e-12)
+        slope = sign * rho_ref / np.sqrt(inside)
+        z_end = z0 + slope * (rho_end - rho_start)
+
+        xs += [cx + rho_start, cx + rho_end, None]  # +x side
+        zs += [z0, z_end, None]
+        xs += [cx - rho_start, cx - rho_end, None]  # -x side (mirror)
+        zs += [z0, z_end, None]
+
+    return xs, zs
+
+
 @st.cache_data(show_spinner=False)
 def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
     """
-    Geometry (surface arc points) + a small ray fan traced through the full
-    path (not just the final PV-plane point), for the optical-layout diagram.
+    Geometry (surface profile points) + a small ray fan traced through the
+    full path (not just the final PV-plane point), for the optical-layout
+    diagram.
     """
     system = make_system(values)
     aperture = values["ray_radius_mm"] * 1e-3
@@ -186,10 +237,14 @@ def compute_optical_layout(values, n_fan_rays=7, lam_nm=550.0):
         R = surf.R
         cx, cz = surf.center[0], surf.center[2]
         half_ap = min(aperture * 1.3, abs(R) * 0.97) if R != 0 else aperture * 1.3
-        xs = np.linspace(-half_ap, half_ap, 60) + cx
-        sign = 1.0 if R >= 0 else -1.0
-        zs = cz - sign * np.sqrt(np.maximum(R ** 2 - (xs - cx) ** 2, 0.0))
-        surfaces.append((xs, zs))
+        if surf.surface_type == "fresnel":
+            xs, zs = _fresnel_zone_profile(R, cx, cz, half_ap, surf.groove_pitch)
+        else:
+            xs_arr = np.linspace(-half_ap, half_ap, 60) + cx
+            sign = 1.0 if R >= 0 else -1.0
+            zs_arr = cz - sign * np.sqrt(np.maximum(R ** 2 - (xs_arr - cx) ** 2, 0.0))
+            xs, zs = xs_arr, zs_arr
+        surfaces.append((xs, zs, surf.surface_type))
 
     return {"paths": paths, "surfaces": surfaces, "z_target": system.z_target}
 
@@ -203,13 +258,14 @@ def plot_rms_plotly(series):
     fig = go.Figure()
     for values, label, color in series:
         trace = trace_all_wavelengths(values)
+        marker_colors = [_wavelength_color(lam) for lam in trace["lam_m"]]
         fig.add_trace(go.Scatter(
             x=trace["lam_m"] * 1e9,
             y=trace["rms_um"],
             mode="lines+markers",
             name=label,
             line=dict(color=color, width=2),
-            marker=dict(size=6),
+            marker=dict(size=9, color=marker_colors, line=dict(width=1, color="rgba(0,0,0,0.35)")),
             hovertemplate=f"%{{x:.0f}} nm<br>RMS = %{{y:.3f}} µm<extra>{label}</extra>",
         ))
     fig.add_vrect(x0=500, x1=900, fillcolor="green", opacity=0.08, line_width=0,
@@ -272,16 +328,31 @@ def plot_spots_plotly(values):
     return fig
 
 
+def _scale_with_gaps(seq, factor):
+    """Like seq * factor, but seq may be a plain list containing None line-break
+    markers (as built by _fresnel_zone_profile) instead of a numpy array."""
+    return [v * factor if v is not None else None for v in seq]
+
+
 def plot_optical_layout_plotly(values, n_fan_rays=7, lam_nm=550.0):
     data = compute_optical_layout(values, n_fan_rays=n_fan_rays, lam_nm=lam_nm)
     fig = go.Figure()
 
-    for xs, zs in data["surfaces"]:
+    surface_colors = {"spherical": "#4C78A8", "fresnel": "#F58518"}
+    legend_shown = set()
+    for xs, zs, surf_type in data["surfaces"]:
+        is_fresnel = surf_type == "fresnel"
+        x_plot = _scale_with_gaps(zs, 1e3) if is_fresnel else zs * 1e3
+        y_plot = _scale_with_gaps(xs, 1e3) if is_fresnel else xs * 1e3
         fig.add_trace(go.Scatter(
-            x=zs * 1e3, y=xs * 1e3, mode="lines",
-            line=dict(color="#4C78A8", width=2),
-            hoverinfo="skip", showlegend=False,
+            x=x_plot, y=y_plot, mode="lines",
+            line=dict(color=surface_colors[surf_type], width=2),
+            hoverinfo="skip",
+            name=surf_type.capitalize(),
+            legendgroup=surf_type,
+            showlegend=surf_type not in legend_shown,
         ))
+        legend_shown.add(surf_type)
 
     n_paths = len(data["paths"])
     for i, (pts, alive, power) in enumerate(data["paths"]):
@@ -424,6 +495,9 @@ def flatten_values_for_export(values):
     rows = [{"parameter": "n_layers", "value": values["n_layers"]}]
     for i, r in enumerate(values["radii_mm"]):
         rows.append({"parameter": f"R{i}_mm", "value": r})
+        rows.append({"parameter": f"R{i}_type", "value": values["surface_types"][i]})
+        if values["groove_pitches_mm"][i] is not None:
+            rows.append({"parameter": f"R{i}_pitch_mm", "value": values["groove_pitches_mm"][i]})
     for i, t in enumerate(values["thicknesses_mm"]):
         rows.append({"parameter": f"t{i + 1}_mm", "value": t})
     for i, m in enumerate(values["materials"]):
@@ -456,6 +530,25 @@ if "_apply_params" in st.session_state:
     for _key, _val in st.session_state.pop("_apply_params").items():
         st.session_state[_key] = _val
 
+def _render_surface_type_widget(key_prefix, label):
+    """Spherical/Fresnel selector for one surface, plus a groove-pitch field
+    that only appears when Fresnel is selected. Returns (type, pitch_mm)."""
+    surf_type = st.selectbox(
+        f"{label} type", ["Spherical", "Fresnel"], key=f"{key_prefix}_type",
+    )
+    if surf_type == "Fresnel":
+        pitch = st.number_input(
+            f"{label} groove pitch (mm)", min_value=0.01,
+            value=DEFAULT_GROOVE_PITCH_MM, step=0.05, format="%.3f", key=f"{key_prefix}_pitch",
+            help="Radial width of each Fresnel zone — smaller pitch means "
+                 "more/finer grooves, closer to the smooth (spherical) curve; "
+                 "larger pitch means fewer, coarser grooves and more faceting error.",
+        )
+    else:
+        pitch = None
+    return surf_type.lower(), pitch
+
+
 with st.sidebar:
     st.header("Lens geometry")
     n_layers = st.number_input(
@@ -472,6 +565,7 @@ with st.sidebar:
     with st.form("controls_form"):
         material_names_list = list(optics.CANDIDATE_MATERIALS.keys())
         radii_mm, thicknesses_mm, materials_sel = [], [], []
+        surface_types, groove_pitches_mm = [], []
 
         for i in range(n_layers):
             st.markdown(f"**Layer {i + 1}**")
@@ -479,6 +573,9 @@ with st.sidebar:
             r_default = DEFAULT_RADII_MM[i] if i < len(DEFAULT_RADII_MM) else DEFAULT_RADII_MM[-1]
             r = st.number_input(r_label, value=r_default, step=1.0, format="%.3f", key=f"R{i}_mm")
             radii_mm.append(r)
+            surf_type, pitch = _render_surface_type_widget(f"R{i}", f"R{i}")
+            surface_types.append(surf_type)
+            groove_pitches_mm.append(pitch)
 
             t = st.number_input(
                 f"Layer {i + 1} thickness (mm)", min_value=0.5,
@@ -499,6 +596,9 @@ with st.sidebar:
             step=1.0, format="%.3f", key=f"R{n_layers}_mm",
         )
         radii_mm.append(r_exit)
+        surf_type, pitch = _render_surface_type_widget(f"R{n_layers}", f"R{n_layers}")
+        surface_types.append(surf_type)
+        groove_pitches_mm.append(pitch)
 
         f_mm = st.number_input(
             "PV plane / target focal length (mm)", min_value=1.0,
@@ -556,6 +656,8 @@ with st.sidebar:
 values = {
     "n_layers": n_layers,
     "radii_mm": radii_mm,
+    "surface_types": surface_types,
+    "groove_pitches_mm": groove_pitches_mm,
     "thicknesses_mm": thicknesses_mm,
     "materials": materials_sel,
     "f_mm": f_mm,
@@ -624,7 +726,7 @@ with tab_analysis:
                     "Optical efficiency": "{:.1%}",
                     "Rays reaching PV": "{:.0f}",
                 }
-            ),
+            ).map(_wavelength_cell_style, subset=["Wavelength (nm)"]),
             use_container_width=True,
             hide_index=True,
         )
@@ -663,6 +765,8 @@ with tab_survey:
                     verbose=False,
                     lam_list=get_lambda_grid(values),
                     rays_in=get_rays_in(values),
+                    surface_types=values["surface_types"],
+                    groove_pitches=get_groove_pitches_m(values),
                 )
 
             survey_df = pd.DataFrame(
@@ -705,6 +809,8 @@ with tab_optimize:
                 maxiter=int(values["opt_maxiter"]),
                 lam_list=get_lambda_grid(values),
                 rays_in=get_rays_in(values),
+                surface_types=values["surface_types"],
+                groove_pitches=get_groove_pitches_m(values),
                 progress_callback=_report_progress,
             )
 
@@ -841,6 +947,8 @@ with tab_auto:
                 lam_list=get_lambda_grid(values),
                 rays_in=get_rays_in(values),
                 method=values["opt_method"],
+                surface_types=values["surface_types"],
+                groove_pitches=get_groove_pitches_m(values),
                 full_optimize_threshold=int(full_optimize_threshold),
                 screen_maxiter=int(screen_maxiter),
                 halving_rounds=int(halving_rounds),
